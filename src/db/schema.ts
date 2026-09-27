@@ -1,0 +1,1469 @@
+import {
+  pgTable,
+  uuid,
+  text,
+  integer,
+  timestamp,
+  date,
+  boolean,
+  pgEnum,
+  jsonb,
+  doublePrecision,
+  numeric,
+  primaryKey,
+  unique,
+} from "drizzle-orm/pg-core";
+import { relations } from "drizzle-orm";
+
+// ── Enums ──────────────────────────────────────────────
+
+export const taskPriorityEnum = pgEnum("task_priority", [
+  "low",
+  "medium",
+  "high",
+]);
+
+export const taskStatusEnum = pgEnum("task_status", [
+  "backlog",
+  "todo",
+  "in_progress",
+  "done",
+  "canceled",
+]);
+
+export const callStatusEnum = pgEnum("call_status", [
+  "initiated",
+  "ringing",
+  "in_progress",
+  "completed",
+  "failed",
+  "busy",
+  "no_answer",
+  "queued",
+  "canceled",
+]);
+
+export const callTypeEnum = pgEnum("call_type", ["incoming", "outgoing"]);
+
+export const telephonyMediumEnum = pgEnum("telephony_medium", [
+  "manual",
+  "twilio",
+  "exotel",
+]);
+
+export const employeeSizeEnum = pgEnum("employee_size", [
+  "1-10",
+  "11-50",
+  "51-200",
+  "201-500",
+  "501-1000",
+  "1000+",
+]);
+
+export const viewTypeEnum = pgEnum("view_type", [
+  "list",
+  "kanban",
+  "group_by",
+]);
+
+export const activityTypeEnum = pgEnum("activity_type", [
+  "email",
+  "whatsapp",
+  "sms",
+  "note",
+  "call",
+  "status_change",
+  "comment",
+  "task",
+  "webhook_in",
+]);
+
+export const activityDirectionEnum = pgEnum("activity_direction", [
+  "inbound",
+  "outbound",
+]);
+
+export const referenceTypeEnum = pgEnum("reference_type", [
+  "lead",
+  "deal",
+  "contact",
+  "organization",
+]);
+
+export const bootcampStatusEnum = pgEnum("bootcamp_status", [
+  "draft", // brouillon
+  "open", // capte les leads (formation à venir)
+  "in_progress", // formation commencée (jour J passé)
+  "completed", // terminée
+  "cancelled", // annulée
+]);
+
+// ── Enums pivot formation-centric (Phase 1) ────────────
+
+export const stageKindEnum = pgEnum("stage_kind", ["normal", "converted", "lost"]);
+
+export const temperatureEnum = pgEnum("temperature", ["hot", "cold"]);
+
+// Qualification commerciale posée après un appel. Volontairement courte :
+// une liste longue ne se clique pas, elle se contourne.
+export const leadQualificationEnum = pgEnum("lead_qualification", [
+  "chaud",
+  "tiede",
+  "froid",
+  "pas_serieux",
+  "hors_cible",
+  "reporte", // intéressé, mais pour une prochaine session
+]);
+
+export const paymentPlanEnum = pgEnum("payment_plan", ["total", "monthly"]);
+
+// ── Bootcamps (Formations) ─────────────────────────────
+
+export const bootcamps = pgTable("bootcamps", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  slug: text("slug").notNull().unique(), // "bootcamp-dev-janv-2026" (URL webhook)
+  description: text("description"),
+  startDate: date("start_date"), // ⭐ le plus important
+  endDate: date("end_date"),
+  status: bootcampStatusEnum("status").notNull().default("open"),
+  capacity: integer("capacity"), // nb de places
+  // Offre de prix (B1 : "Converti" = inscrit + 1er paiement encaissé)
+  priceTotal: numeric("price_total"), // prix total payé en une fois
+  currency: text("currency").notNull().default("TND"),
+  monthlyCount: integer("monthly_count"), // nb de mensualités (plan mensuel)
+  monthlyAmount: numeric("monthly_amount"), // montant d'une mensualité
+  // NULL = active. Archiver range la formation sans rien détruire, et coupe
+  // l'import de ses formulaires (cf. getActiveElementorSources).
+  archivedAt: timestamp("archived_at"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// ── Config / Meta ──────────────────────────────────────
+
+export const leadStatuses = pgTable("lead_statuses", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  color: text("color").notNull().default("gray"),
+  position: integer("position").notNull().default(0),
+  isDefault: boolean("is_default").notNull().default(false),
+  bootcampId: uuid("bootcamp_id").references(() => bootcamps.id), // pipeline par formation
+  // Colonnes système (Phase 1) — 2 stages système par bootcamp : "Converti" + "Lost"
+  isSystem: boolean("is_system").notNull().default(false),
+  kind: stageKindEnum("kind").notNull().default("normal"),
+});
+// TODO (backfill kind) — après migration, aucun stage existant ne matche ILIKE '%converti%'
+// (les stages s'appellent "Converted" EN / "Inscrit" FR). Résultat backfill :
+//   - bc 00000000-0000-0000-0000-000000000001 ("Formation par défaut") : "Lost"→lost ✓, "Converted"→normal (restera normal, à nettoyer)
+//   - bc e8211853-4846-462f-84b7-49e8e42696e6 : "Perdu"→lost ✓, aucun converted
+// → Les 2 bootcamps manquent d'un stage kind='converted'. Action : appeler
+//   ensureSystemStages(<bootcampId>) pour semer "Converti"/"Lost", ou renommer "Converted"/"Inscrit".
+
+export const dealStatuses = pgTable("deal_statuses", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  color: text("color").notNull().default("gray"),
+  position: integer("position").notNull().default(0),
+  isDefault: boolean("is_default").notNull().default(false),
+});
+
+export const leadSources = pgTable("lead_sources", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+});
+
+export const industries = pgTable("industries", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+});
+
+export const lostReasons = pgTable("lost_reasons", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+});
+
+export const territories = pgTable("territories", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+});
+
+// ── Organizations & Contacts ───────────────────────────
+
+export const organizations = pgTable("organizations", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  website: text("website"),
+  logo: text("logo"),
+  noOfEmployees: employeeSizeEnum("no_of_employees"),
+  annualRevenue: numeric("annual_revenue"),
+  industryId: uuid("industry_id").references(() => industries.id),
+  territoryId: uuid("territory_id").references(() => territories.id),
+  currency: text("currency").default("EUR"),
+  address: text("address"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+export const contacts = pgTable("contacts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  salutation: text("salutation"),
+  firstName: text("first_name"),
+  lastName: text("last_name"),
+  fullName: text("full_name").notNull(),
+  email: text("email"),
+  mobileNo: text("mobile_no"),
+  phone: text("phone"),
+  whatsapp: text("whatsapp"), // numéro WhatsApp de la personne (suit le contact d'une formation à l'autre)
+  age: integer("age"), // âge de la personne
+  gender: text("gender"),
+  image: text("image"),
+  organizationId: uuid("organization_id").references(() => organizations.id),
+  // Fix dédup P2 : un contact créé via match mobile seul (pas email) est flagué
+  // pour révision manuelle — on ne fusionne jamais deux humains à tort.
+  possibleDuplicate: boolean("possible_duplicate").notNull().default(false),
+  // Désabonnement global aux campagnes. Les échanges 1-à-1 depuis la fiche
+  // lead restent possibles : ce sont des réponses, pas du marketing.
+  unsubscribedAt: timestamp("unsubscribed_at"),
+  // Dernière raison connue (cf. campaigns/unsubscribe-reasons.ts), campagne ou pas.
+  unsubscribeReason: text("unsubscribe_reason"),
+  unsubscribeNote: text("unsubscribe_note"),
+  unsubscribeToken: text("unsubscribe_token")
+    .notNull()
+    .$defaultFn(() => crypto.randomUUID()),
+  // Rebond DUR uniquement (adresse inexistante). Une boîte pleine ou une
+  // absence temporaire n'entre pas ici : on ne bannit pas quelqu'un en congé.
+  bouncedAt: timestamp("bounced_at"),
+  bounceReason: text("bounce_reason"),
+  // Consentement WhatsApp : Meta exige la preuve (quand, où, quel texte)
+  // avant tout premier message. Posé une fois, jamais écrasé.
+  whatsappConsentAt: timestamp("whatsapp_consent_at"),
+  whatsappConsentSource: text("whatsapp_consent_source"), // nom du formulaire
+  whatsappConsentText: text("whatsapp_consent_text"), // libellé de la case cochée
+  // A répondu STOP : plus aucun modèle automatique ; un START ou une nouvelle
+  // case cochée le lève.
+  whatsappUnsubscribedAt: timestamp("whatsapp_unsubscribed_at"),
+  // Meta a répondu « pas sur WhatsApp ou a bloqué l'école » (131026) : plus d'envoi automatique (0165).
+  whatsappInvalidAt: timestamp("whatsapp_invalid_at"),
+  // Meta refuse le marketing vers cette personne (131049) : on attend 24 h.
+  whatsappMarketingLimitedUntil: timestamp("whatsapp_marketing_limited_until"),
+  // Dernier modèle MARKETING parti vers elle : jamais plus d'un par 24 h.
+  whatsappMarketingLastAt: timestamp("whatsapp_marketing_last_at"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// ── Leads ──────────────────────────────────────────────
+
+export type AdReferral = {
+  source_id?: string;
+  source_type?: string; // ad | post
+  headline?: string;
+  body?: string;
+  source_url?: string;
+  ctwa_clid?: string;
+  at?: string;
+};
+
+export const leads = pgTable("leads", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  salutation: text("salutation"),
+  firstName: text("first_name"),
+  lastName: text("last_name"),
+  fullName: text("full_name").notNull(),
+  email: text("email"),
+  mobileNo: text("mobile_no"),
+  phone: text("phone"),
+  website: text("website"),
+  image: text("image"),
+  jobTitle: text("job_title"),
+  organizationName: text("organization_name"),
+  organizationId: uuid("organization_id").references(() => organizations.id),
+  bootcampId: uuid("bootcamp_id").references(() => bootcamps.id), // formation de rattachement
+  contactId: uuid("contact_id").references(() => contacts.id), // la personne (dédupliquée) — wiring Phase 2
+  statusId: uuid("status_id").references(() => leadStatuses.id),
+  sourceId: uuid("source_id").references(() => leadSources.id),
+  industryId: uuid("industry_id").references(() => industries.id),
+  owner: text("owner"),
+  converted: boolean("converted").notNull().default(false),
+  lastContactedAt: timestamp("last_contacted_at"),
+  // État pipeline (Phase 1)
+  temperature: temperatureEnum("temperature").notNull().default("cold"),
+  stageEnteredAt: timestamp("stage_entered_at").notNull().defaultNow(), // alimente l'alerte de stagnation
+  // NULL = jamais ouvert par un humain. Posé à la 1ʳᵉ ouverture de la fiche.
+  seenAt: timestamp("seen_at"),
+  convertedAt: timestamp("converted_at"), // date de conversion (B1)
+  rawPayload: jsonb("raw_payload"), // infos brutes du formulaire d'entrée
+  formSourceId: uuid("form_source_id").references(() => formSources.id), // d'où vient le lead
+  intendedPlan: paymentPlanEnum("intended_plan"), // plan envisagé (noté pendant le pipeline, avant inscription)
+  promoCode: text("promo_code"),
+  // Le code reconnu dans promo_codes (0155) — le texte tapé reste dans promoCode.
+  promoCodeId: uuid("promo_code_id"),
+  // La pub Meta qui a amené le lead sur WhatsApp (0159) : { source_id, source_type, headline, source_url, ctwa_clid, at }.
+  adReferral: jsonb("ad_referral").$type<AdReferral | null>(),
+  // Pas de rappel d'échéance WhatsApp pour cet inscrit (arrangement de paiement) — 0163.
+  noPaymentReminder: boolean("no_payment_reminder").notNull().default(false),
+  // ── L'offre NÉGOCIÉE avec ce lead (migration 0124) ──
+  // Distincte du tarif catalogue de la formation : on négocie, et une remise
+  // accordée trois semaines avant l'inscription n'avait aucun endroit où vivre.
+  // Vide = on applique le tarif de la formation.
+  offerTotal: numeric("offer_total"),
+  offerMonthlyCount: integer("offer_monthly_count"),
+  offerMonthlyAmount: numeric("offer_monthly_amount"), // code promo de l'inscription (info du lead, pas de la personne)
+  // Qualification issue du DERNIER appel. L'historique complet vit dans
+  // call_logs + activities ; ceci est l'état courant, celui qui pilote la file.
+  qualification: leadQualificationEnum("qualification"),
+  qualifiedAt: timestamp("qualified_at"),
+  // « À rappeler le » : c'est CE champ qui fait remonter un lead au bon moment.
+  nextFollowUpAt: timestamp("next_follow_up_at"),
+  // Lead repris d'une formation précédente. Garde le lien plutôt que de
+  // recopier l'historique : la vérité reste à un seul endroit.
+  carriedFromLeadId: uuid("carried_from_lead_id"),
+  // Réponses de formulaire qui n'entraient dans aucune colonne : elles ne
+  // survivaient que dans rawPayload, donc invisibles dans la fiche.
+  motivation: text("motivation"), // « pourquoi tu veux étudier avec nous » (texte libre)
+  wantsCall: boolean("wants_call"), // « souhaitez-vous être contacté par téléphone »
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  // L'utilisateur a tranché sur l'alerte de doublon d'adresse pour ce lead.
+  duplicateDismissedAt: timestamp("duplicate_dismissed_at"),
+});
+
+// ── Deals ──────────────────────────────────────────────
+
+export const deals = pgTable("deals", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  leadId: uuid("lead_id").references(() => leads.id),
+  organizationId: uuid("organization_id").references(() => organizations.id),
+  statusId: uuid("status_id").references(() => dealStatuses.id),
+  sourceId: uuid("source_id").references(() => leadSources.id),
+  industryId: uuid("industry_id").references(() => industries.id),
+  territoryId: uuid("territory_id").references(() => territories.id),
+  probability: numeric("probability").default("0"),
+  dealValue: numeric("deal_value").default("0"),
+  expectedDealValue: numeric("expected_deal_value"),
+  annualRevenue: numeric("annual_revenue"),
+  currency: text("currency").default("EUR"),
+  exchangeRate: numeric("exchange_rate").default("1"),
+  owner: text("owner"),
+  nextStep: text("next_step"),
+  lostReasonId: uuid("lost_reason_id").references(() => lostReasons.id),
+  lostNotes: text("lost_notes"),
+  expectedClosureDate: date("expected_closure_date"),
+  closedDate: date("closed_date"),
+  firstName: text("first_name"),
+  lastName: text("last_name"),
+  email: text("email"),
+  mobileNo: text("mobile_no"),
+  phone: text("phone"),
+  jobTitle: text("job_title"),
+  website: text("website"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+export const dealContacts = pgTable("deal_contacts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  dealId: uuid("deal_id")
+    .notNull()
+    .references(() => deals.id, { onDelete: "cascade" }),
+  contactId: uuid("contact_id")
+    .notNull()
+    .references(() => contacts.id, { onDelete: "cascade" }),
+  isPrimary: boolean("is_primary").notNull().default(false),
+});
+
+// ── Products ───────────────────────────────────────────
+
+export const products = pgTable("products", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  description: text("description"),
+  image: text("image"),
+  price: numeric("price").default("0"),
+  currency: text("currency").default("EUR"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+export const dealProducts = pgTable("deal_products", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  dealId: uuid("deal_id")
+    .notNull()
+    .references(() => deals.id, { onDelete: "cascade" }),
+  productId: uuid("product_id")
+    .notNull()
+    .references(() => products.id, { onDelete: "cascade" }),
+  qty: numeric("qty").default("1"),
+  rate: numeric("rate").default("0"),
+  amount: numeric("amount").default("0"),
+});
+
+// ── Tasks ──────────────────────────────────────────────
+
+export const tasks = pgTable("tasks", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  title: text("title").notNull(),
+  priority: taskPriorityEnum("priority").notNull().default("medium"),
+  status: taskStatusEnum("status").notNull().default("todo"),
+  assignedTo: text("assigned_to"),
+  startDate: date("start_date"),
+  dueDate: timestamp("due_date"),
+  description: text("description"),
+  referenceType: referenceTypeEnum("reference_type"),
+  referenceId: uuid("reference_id"),
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// ── Notes ──────────────────────────────────────────────
+
+export const notes = pgTable("notes", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  title: text("title"),
+  content: text("content").notNull(),
+  referenceType: referenceTypeEnum("reference_type"),
+  referenceId: uuid("reference_id"),
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// ── Call Logs ──────────────────────────────────────────
+
+export const callLogs = pgTable("call_logs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  fromNumber: text("from_number"),
+  toNumber: text("to_number"),
+  status: callStatusEnum("status").notNull().default("initiated"),
+  type: callTypeEnum("type").notNull().default("outgoing"),
+  telephonyMedium: telephonyMediumEnum("telephony_medium")
+    .notNull()
+    .default("manual"),
+  startTime: timestamp("start_time"),
+  endTime: timestamp("end_time"),
+  duration: integer("duration").default(0),
+  recordingUrl: text("recording_url"),
+  callerId: text("caller_id"),
+  receiverId: text("receiver_id"),
+  noteId: uuid("note_id").references(() => notes.id),
+  referenceType: referenceTypeEnum("reference_type"),
+  referenceId: uuid("reference_id"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// ── Comments ───────────────────────────────────────────
+
+export const comments = pgTable("comments", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  content: text("content").notNull(),
+  referenceType: referenceTypeEnum("reference_type"),
+  referenceId: uuid("reference_id"),
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// ── Activities (unified timeline) ──────────────────────
+
+export const activities = pgTable("activities", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  referenceType: referenceTypeEnum("reference_type"),
+  referenceId: uuid("reference_id"),
+  type: activityTypeEnum("type").notNull(),
+  direction: activityDirectionEnum("direction")
+    .notNull()
+    .default("outbound"),
+  subject: text("subject"),
+  content: text("content"),
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// ── Email Templates ────────────────────────────────────
+
+export const emailTemplates = pgTable("email_templates", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  subject: text("subject"),
+  content: text("content").notNull(),
+  // Bouton principal, piloté par un interrupteur. Les boutons SUPPLÉMENTAIRES
+  // vivent dans le contenu ([[Texte]](url), inséré au curseur) — celui-ci est
+  // le call-to-action, toujours au même endroit.
+  buttonEnabled: boolean("button_enabled").notNull().default(false),
+  buttonLabel: text("button_label"),
+  buttonUrl: text("button_url"),
+  buttonPosition: text("button_position").notNull().default("bottom"), // top | bottom
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// ── View Settings (custom views) ───────────────────────
+
+export const viewSettings = pgTable("view_settings", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  label: text("label").notNull(),
+  routeName: text("route_name").notNull(),
+  doctype: text("doctype").notNull(),
+  type: viewTypeEnum("type").notNull().default("list"),
+  columns: jsonb("columns"),
+  filters: jsonb("filters"),
+  orderBy: jsonb("order_by"),
+  groupByField: text("group_by_field"),
+  columnField: text("column_field"),
+  kanbanColumns: jsonb("kanban_columns"),
+  kanbanFields: jsonb("kanban_fields"),
+  titleField: text("title_field"),
+  userId: text("user_id"),
+  public: boolean("public").notNull().default(false),
+  pinned: boolean("pinned").notNull().default(false),
+  isDefault: boolean("is_default").notNull().default(false),
+  isStandard: boolean("is_standard").notNull().default(false),
+  icon: text("icon"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// ── Notifications ──────────────────────────────────────
+
+export const notificationTypeEnum = pgEnum("notification_type", [
+  "lead_assigned",
+  "lead_status_change",
+  "deal_status_change",
+  "task_assigned",
+  "task_due",
+  "comment",
+  "mention",
+  // Inscription confirmée (migration 0145) : la cloche joue le tiroir-caisse.
+  "lead_enrolled",
+  // L'assistant WhatsApp passe la main à un humain (migration 0153).
+  "assistant_escalade",
+  // Un formulaire du site vient de créer une fiche (migration 0169).
+  "lead_nouveau",
+]);
+
+export const notifications = pgTable("notifications", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  type: notificationTypeEnum("type").notNull(),
+  message: text("message").notNull(),
+  referenceType: referenceTypeEnum("reference_type"),
+  referenceId: uuid("reference_id"),
+  userId: text("user_id"),
+  read: boolean("read").notNull().default(false),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// ── Tags (Phase 1) ─────────────────────────────────────
+
+export const tags = pgTable("tags", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull().unique(),
+  color: text("color").notNull().default("gray"),
+});
+
+export const leadTags = pgTable(
+  "lead_tags",
+  {
+    leadId: uuid("lead_id")
+      .notNull()
+      .references(() => leads.id, { onDelete: "cascade" }),
+    tagId: uuid("tag_id")
+      .notNull()
+      .references(() => tags.id, { onDelete: "cascade" }),
+  },
+  (t) => [primaryKey({ columns: [t.leadId, t.tagId] })]
+);
+
+// ── Payment Schedules (Phase 1) ────────────────────────
+
+export const paymentSchedules = pgTable("payment_schedules", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  leadId: uuid("lead_id")
+    .notNull()
+    .references(() => leads.id, { onDelete: "cascade" }),
+  plan: paymentPlanEnum("plan").notNull(),
+  dueDate: date("due_date"),
+  amount: numeric("amount"),
+  isPaid: boolean("is_paid").notNull().default(false),
+  paidAt: timestamp("paid_at"),
+  // ── Qui a encaissé, et la preuve (migration 0125) ──
+  // Portés par l'ÉCHÉANCE, pas par le lead : quelqu'un qui paie en trois fois
+  // peut verser le premier en espèces et le deuxième par virement.
+  // Email d'un membre de l'équipe, ou 'banque' pour un virement sur le compte.
+  // Pas de clé étrangère : retirer quelqu'un de l'équipe ne doit pas effacer
+  // la trace de ce qu'il a encaissé.
+  receivedBy: text("received_by"),
+  // Comment l'argent est arrivé : 'especes' | 'virement' | 'cheque'.
+  // Le MOYEN dit comment il est arrivé, le DÉTENTEUR où il se trouve.
+  method: text("method"),
+  // Chemin DANS le bucket privé, jamais une URL : l'adresse signée se fabrique
+  // à la lecture et expire. Un justificatif de virement porte un RIB.
+  proofPath: text("proof_path"),
+  proofName: text("proof_name"),
+  proofUploadedAt: timestamp("proof_uploaded_at"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// ── Form Sources (Phase 1) ─────────────────────────────
+// Source d'entrée typée par bootcamp (DISTINCT de lead_sources qui reste la liste de réf.)
+export const formSources = pgTable("form_sources", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  bootcampId: uuid("bootcamp_id").references(() => bootcamps.id),
+  name: text("name").notNull(),
+  targetStatusId: uuid("target_status_id").references(() => leadStatuses.id),
+  temperature: temperatureEnum("temperature").default("cold"),
+  defaultTagIds: jsonb("default_tag_ids").default([]),
+  webhookToken: text("webhook_token").notNull().unique(),
+  // Lien Elementor (pull par API). Un formulaire n'alimente qu'UNE formation :
+  // index unique partiel sur (elementor_form_id) WHERE active — migration 0009.
+  elementorFormId: text("elementor_form_id"), // "<postId>_<elementId>", ex. "8826_4851b85"
+  lastSubmissionId: integer("last_submission_id"), // curseur : dernière soumission importée
+  active: boolean("active").notNull().default(true),
+  fieldMapping: jsonb("field_mapping").notNull().default({}), // { "<champ Elementor>": "<colonne lead whitelistée>" }
+  // Dernier payload brut reçu (diagnostic mapping) — écrit par le webhook à chaque POST.
+  lastPayload: jsonb("last_payload"),
+  lastReceivedAt: timestamp("last_received_at"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// ── Note Templates (Phase 1) ───────────────────────────
+
+export const noteTemplates = pgTable("note_templates", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  text: text("text").notNull(),
+  position: integer("position").notNull().default(0),
+});
+
+// ── Allowed Emails (pré-déploiement) ────────────────────
+// Liste blanche des emails autorisés à créer un compte.
+// Seul un email présent ici peut passer signup().
+export const allowedEmails = pgTable("allowed_emails", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  email: text("email").notNull().unique(),
+  note: text("note"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  // Droits par membre (migration 0168) — lus par src/lib/droits.ts.
+  role: text("role").notNull().default("membre"),
+  permissions: jsonb("permissions").$type<Record<string, string>>().notNull().default({}),
+});
+
+// ── Connexion WordPress ────────────────────────────────
+// Credentials du site WP dont on aspire les soumissions Elementor.
+// Table à ligne unique : `id` est un booléen contraint à true (pas de 2e ligne possible).
+// ⚠️ appPassword est stocké en clair et n'est JAMAIS renvoyé au client (cf. getWpConnectionPublic).
+export const wpConnection = pgTable("wp_connection", {
+  id: boolean("id").primaryKey().default(true),
+  siteUrl: text("site_url").notNull(),
+  username: text("username").notNull(),
+  appPassword: text("app_password").notNull(),
+  lastTestedAt: timestamp("last_tested_at"),
+  lastTestOk: boolean("last_test_ok"),
+  lastTestMessage: text("last_test_message"),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// ── Stage History (Phase 1) ────────────────────────────
+// Capture structurée des transitions de statut (l'activity status_change restait en texte libre)
+export const stageHistory = pgTable("stage_history", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  leadId: uuid("lead_id")
+    .notNull()
+    .references(() => leads.id, { onDelete: "cascade" }),
+  fromStatusId: uuid("from_status_id"),
+  toStatusId: uuid("to_status_id"),
+  changedBy: text("changed_by"),
+  changedAt: timestamp("changed_at").notNull().defaultNow(),
+});
+
+// ── Campagnes email ────────────────────────────────────
+
+export const campaigns = pgTable("campaigns", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  subject: text("subject"),
+  content: text("content").notNull().default(""),
+  // draft | scheduled | sending | sent | failed
+  status: text("status").notNull().default("draft"),
+  targetTagIds: jsonb("target_tag_ids").notNull().default([]),
+  /** Tags à ne pas cibler : la personne qui en porte un (sur n'importe quelle
+   *  fiche) est retirée, même si elle a aussi un tag ciblé. */
+  excludeTagIds: jsonb("exclude_tag_ids").notNull().default([]),
+  /** Ne garder que les personnes qui ont un Mobile. */
+  requirePhone: boolean("require_phone").notNull().default(false),
+  targetEmails: jsonb("target_emails").notNull().default([]),
+  /** Note d'équipe, jamais envoyée. Reprise de Kit : savoir de quoi parle une
+   *  campagne sans l'ouvrir. */
+  internalNote: text("internal_note"),
+  scheduledAt: timestamp("scheduled_at"),
+  sentAt: timestamp("sent_at"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// Une ligne par destinataire : c'est ce qui permet de reprendre un envoi
+// interrompu sans réexpédier, d'étaler au-delà du quota quotidien, et de
+// savoir qui a réellement reçu quoi. L'index unique (campaign_id, lower(email))
+// porte la garantie anti-doublon côté base, pas côté applicatif.
+export const campaignRecipients = pgTable("campaign_recipients", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  campaignId: uuid("campaign_id")
+    .notNull()
+    .references(() => campaigns.id, { onDelete: "cascade" }),
+  // SET NULL : supprimer un contact n'efface pas la trace de l'envoi.
+  contactId: uuid("contact_id").references(() => contacts.id, {
+    onDelete: "set null",
+  }),
+  email: text("email").notNull(),
+  // pending | sent | failed | skipped
+  status: text("status").notNull().default("pending"),
+  resendId: text("resend_id"),
+  error: text("error"),
+  sentAt: timestamp("sent_at"),
+  // Délivrance réellement constatée par Resend, à distinguer de
+  // « aucun rebond signalé » : un email peut disparaître en silence.
+  deliveredAt: timestamp("delivered_at"),
+  // Première réaction + nombre de fois : une seule des deux perdrait de
+  // l'information (quand a-t-il ouvert / à quel point est-il engagé).
+  openedAt: timestamp("opened_at"),
+  openCount: integer("open_count").notNull().default(0),
+  clickedAt: timestamp("clicked_at"),
+  clickCount: integer("click_count").notNull().default(0),
+  // Désinscription DÉCLENCHÉE PAR cette campagne. `contacts.unsubscribed_at`
+  // dit que la personne est désabonnée ; ceci dit d'où ça vient.
+  unsubscribedAt: timestamp("unsubscribed_at"),
+  // Pourquoi — demandé après le désabonnement, facultatif. Ce que les stats comptent.
+  unsubscribeReason: text("unsubscribe_reason"),
+  unsubscribeNote: text("unsubscribe_note"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// Un clic = une ligne. Agréger par URL répond à « quel lien a marché ».
+export const campaignLinkClicks = pgTable("campaign_link_clicks", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  campaignId: uuid("campaign_id")
+    .notNull()
+    .references(() => campaigns.id, { onDelete: "cascade" }),
+  recipientId: uuid("recipient_id").references(() => campaignRecipients.id, {
+    onDelete: "set null",
+  }),
+  url: text("url").notNull(),
+  clickedAt: timestamp("clicked_at").notNull().defaultNow(),
+});
+
+// ── Relations ──────────────────────────────────────────
+
+export const bootcampsRelations = relations(bootcamps, ({ many }) => ({
+  leadStatuses: many(leadStatuses),
+  leads: many(leads),
+  formSources: many(formSources),
+}));
+
+export const leadStatusesRelations = relations(leadStatuses, ({ one, many }) => ({
+  bootcamp: one(bootcamps, {
+    fields: [leadStatuses.bootcampId],
+    references: [bootcamps.id],
+  }),
+  leads: many(leads),
+  formSources: many(formSources), // via targetStatusId
+}));
+
+export const dealStatusesRelations = relations(dealStatuses, ({ many }) => ({
+  deals: many(deals),
+}));
+
+export const leadSourcesRelations = relations(leadSources, ({ many }) => ({
+  leads: many(leads),
+  deals: many(deals),
+}));
+
+export const industriesRelations = relations(industries, ({ many }) => ({
+  leads: many(leads),
+  deals: many(deals),
+  organizations: many(organizations),
+}));
+
+export const territoriesRelations = relations(territories, ({ many }) => ({
+  organizations: many(organizations),
+  deals: many(deals),
+}));
+
+export const lostReasonsRelations = relations(lostReasons, ({ many }) => ({
+  deals: many(deals),
+}));
+
+export const organizationsRelations = relations(organizations, ({ one, many }) => ({
+  industry: one(industries, {
+    fields: [organizations.industryId],
+    references: [industries.id],
+  }),
+  territory: one(territories, {
+    fields: [organizations.territoryId],
+    references: [territories.id],
+  }),
+  contacts: many(contacts),
+  leads: many(leads),
+  deals: many(deals),
+}));
+
+export const contactsRelations = relations(contacts, ({ one, many }) => ({
+  organization: one(organizations, {
+    fields: [contacts.organizationId],
+    references: [organizations.id],
+  }),
+  dealContacts: many(dealContacts),
+  leads: many(leads), // via leads.contactId (Phase 1)
+}));
+
+export const leadsRelations = relations(leads, ({ one, many }) => ({
+  bootcamp: one(bootcamps, {
+    fields: [leads.bootcampId],
+    references: [bootcamps.id],
+  }),
+  contact: one(contacts, {
+    fields: [leads.contactId],
+    references: [contacts.id],
+  }),
+  status: one(leadStatuses, {
+    fields: [leads.statusId],
+    references: [leadStatuses.id],
+  }),
+  source: one(leadSources, {
+    fields: [leads.sourceId],
+    references: [leadSources.id],
+  }),
+  industry: one(industries, {
+    fields: [leads.industryId],
+    references: [industries.id],
+  }),
+  organization: one(organizations, {
+    fields: [leads.organizationId],
+    references: [organizations.id],
+  }),
+  formSource: one(formSources, {
+    fields: [leads.formSourceId],
+    references: [formSources.id],
+  }),
+  deals: many(deals),
+  leadTags: many(leadTags),
+  paymentSchedules: many(paymentSchedules),
+  stageHistory: many(stageHistory),
+}));
+
+export const dealsRelations = relations(deals, ({ one, many }) => ({
+  lead: one(leads, {
+    fields: [deals.leadId],
+    references: [leads.id],
+  }),
+  organization: one(organizations, {
+    fields: [deals.organizationId],
+    references: [organizations.id],
+  }),
+  status: one(dealStatuses, {
+    fields: [deals.statusId],
+    references: [dealStatuses.id],
+  }),
+  source: one(leadSources, {
+    fields: [deals.sourceId],
+    references: [leadSources.id],
+  }),
+  industry: one(industries, {
+    fields: [deals.industryId],
+    references: [industries.id],
+  }),
+  territory: one(territories, {
+    fields: [deals.territoryId],
+    references: [territories.id],
+  }),
+  lostReason: one(lostReasons, {
+    fields: [deals.lostReasonId],
+    references: [lostReasons.id],
+  }),
+  dealContacts: many(dealContacts),
+  dealProducts: many(dealProducts),
+}));
+
+export const dealContactsRelations = relations(dealContacts, ({ one }) => ({
+  deal: one(deals, {
+    fields: [dealContacts.dealId],
+    references: [deals.id],
+  }),
+  contact: one(contacts, {
+    fields: [dealContacts.contactId],
+    references: [contacts.id],
+  }),
+}));
+
+export const dealProductsRelations = relations(dealProducts, ({ one }) => ({
+  deal: one(deals, {
+    fields: [dealProducts.dealId],
+    references: [deals.id],
+  }),
+  product: one(products, {
+    fields: [dealProducts.productId],
+    references: [products.id],
+  }),
+}));
+
+// ── Relations pivot formation-centric (Phase 1) ────────
+
+export const tagsRelations = relations(tags, ({ many }) => ({
+  leadTags: many(leadTags),
+}));
+
+export const leadTagsRelations = relations(leadTags, ({ one }) => ({
+  lead: one(leads, {
+    fields: [leadTags.leadId],
+    references: [leads.id],
+  }),
+  tag: one(tags, {
+    fields: [leadTags.tagId],
+    references: [tags.id],
+  }),
+}));
+
+export const paymentSchedulesRelations = relations(paymentSchedules, ({ one }) => ({
+  lead: one(leads, {
+    fields: [paymentSchedules.leadId],
+    references: [leads.id],
+  }),
+}));
+
+export const formSourcesRelations = relations(formSources, ({ one, many }) => ({
+  bootcamp: one(bootcamps, {
+    fields: [formSources.bootcampId],
+    references: [bootcamps.id],
+  }),
+  targetStatus: one(leadStatuses, {
+    fields: [formSources.targetStatusId],
+    references: [leadStatuses.id],
+  }),
+  leads: many(leads),
+}));
+
+export const stageHistoryRelations = relations(stageHistory, ({ one }) => ({
+  lead: one(leads, {
+    fields: [stageHistory.leadId],
+    references: [leads.id],
+  }),
+}));
+
+// ── Types ──────────────────────────────────────────────
+
+export type Bootcamp = typeof bootcamps.$inferSelect;
+export type NewBootcamp = typeof bootcamps.$inferInsert;
+export type Lead = typeof leads.$inferSelect;
+export type NewLead = typeof leads.$inferInsert;
+export type Deal = typeof deals.$inferSelect;
+export type NewDeal = typeof deals.$inferInsert;
+export type Contact = typeof contacts.$inferSelect;
+export type NewContact = typeof contacts.$inferInsert;
+export type Organization = typeof organizations.$inferSelect;
+export type NewOrganization = typeof organizations.$inferInsert;
+export type Task = typeof tasks.$inferSelect;
+export type NewTask = typeof tasks.$inferInsert;
+export type Note = typeof notes.$inferSelect;
+export type NewNote = typeof notes.$inferInsert;
+export type CallLog = typeof callLogs.$inferSelect;
+export type NewCallLog = typeof callLogs.$inferInsert;
+export type Comment = typeof comments.$inferSelect;
+export type NewComment = typeof comments.$inferInsert;
+export type Activity = typeof activities.$inferSelect;
+export type NewActivity = typeof activities.$inferInsert;
+export type EmailTemplate = typeof emailTemplates.$inferSelect;
+export type NewEmailTemplate = typeof emailTemplates.$inferInsert;
+export type ViewSetting = typeof viewSettings.$inferSelect;
+export type NewViewSetting = typeof viewSettings.$inferInsert;
+export type LeadStatus = typeof leadStatuses.$inferSelect;
+export type DealStatus = typeof dealStatuses.$inferSelect;
+export type LeadSource = typeof leadSources.$inferSelect;
+export type Industry = typeof industries.$inferSelect;
+export type LostReason = typeof lostReasons.$inferSelect;
+export type Territory = typeof territories.$inferSelect;
+export type Product = typeof products.$inferSelect;
+export type Notification = typeof notifications.$inferSelect;
+// Types pivot formation-centric (Phase 1)
+export type Tag = typeof tags.$inferSelect;
+export type NewTag = typeof tags.$inferInsert;
+export type LeadTag = typeof leadTags.$inferSelect;
+export type PaymentSchedule = typeof paymentSchedules.$inferSelect;
+export type NewPaymentSchedule = typeof paymentSchedules.$inferInsert;
+export type FormSource = typeof formSources.$inferSelect;
+export type NewFormSource = typeof formSources.$inferInsert;
+export type NoteTemplate = typeof noteTemplates.$inferSelect;
+export type NewNoteTemplate = typeof noteTemplates.$inferInsert;
+export type StageHistory = typeof stageHistory.$inferSelect;
+export type NewStageHistory = typeof stageHistory.$inferInsert;
+// ── Habillage des emails ───────────────────────────────
+// Enveloppe commune à TOUS les envois (en-tête + pied de page). Table à ligne
+// unique, même motif que wp_connection : `id` est un booléen contraint à true.
+
+export const emailBranding = pgTable("email_branding", {
+  id: boolean("id").primaryKey().default(true),
+  // URL absolue et PUBLIQUE : un client mail n'a pas de session.
+  logoUrl: text("logo_url"),
+  logoWidth: integer("logo_width").notNull().default(150),
+  /** Bannière du haut, commune à tous les emails. Une image large REMPLACE le
+   *  logo quand elle est présente. */
+  bannerBg: text("banner_bg").notNull().default("#ffffff"),
+  bannerImageUrl: text("banner_image_url"),
+  bannerTagline: text("banner_tagline"),
+  logoAlt: text("logo_alt"),
+  logoPosition: text("logo_position").notNull().default("left"),
+  headerDivider: text("header_divider").notNull().default("#e0e2ea"),
+  bodyBg: text("body_bg").notNull().default("#ffffff"),
+  titleColor: text("title_color").notNull().default("#212327"),
+  textColor: text("text_color").notNull().default("#5b616f"),
+  boldColor: text("bold_color").notNull().default("#212327"),
+  footnoteColor: text("footnote_color").notNull().default("#a4a8b2"),
+  footerText: text("footer_text"),
+  /** Bouton principal — `accentColor` en porte le fond, historiquement. */
+  accentColor: text("accent_color").notNull().default("#1a1a1a"),
+  primaryBtnText: text("primary_btn_text").notNull().default("#ffffff"),
+  secondaryBtnBg: text("secondary_btn_bg").notNull().default("#ffffff"),
+  secondaryBtnText: text("secondary_btn_text").notNull().default("#3e64de"),
+  secondaryBtnBorder: text("secondary_btn_border").notNull().default("#3e64de"),
+  buttonPosition: text("button_position").notNull().default("left"),
+  /** Expéditeur. Vide = on retombe sur EMAIL_FROM. */
+  senderEmail: text("sender_email"),
+  senderName: text("sender_name"),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+export type EmailBranding = typeof emailBranding.$inferSelect;
+
+// ── Digest quotidien ───────────────────────────────────
+// Une ligne par jour d'envoi. La contrainte d'unicité sur la date EST la
+// garantie d'idempotence : le cron peut taper toutes les 15 min sans risque
+// d'envoyer deux fois.
+
+export const digestRuns = pgTable("digest_runs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  sentOn: date("sent_on").notNull().unique(),
+  recipients: integer("recipients").notNull().default(0),
+  leadsListed: integer("leads_listed").notNull().default(0),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// ── Lecture IA d'un lead ───────────────────────────────
+// Ce que le lead a ÉCRIT lui-même (motivation, situation, âge, pack) est la
+// seule matière riche du CRM : 2 activités humaines pour 188 leads. C'est donc
+// là que l'IA travaille, pas sur un historique qui n'existe pas.
+
+export const leadIntentEnum = pgEnum("lead_intent", [
+  "serieux", // prêt à s'engager, motivation claire
+  "curieux", // intéressé mais vague ou hésitant
+  "hors_cible", // ne correspond pas à la formation
+  "indetermine", // pas assez d'éléments pour trancher
+]);
+
+export const leadInsights = pgTable("lead_insights", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  leadId: uuid("lead_id")
+    .notNull()
+    .unique()
+    .references(() => leads.id, { onDelete: "cascade" }),
+  summary: text("summary").notNull(),
+  intent: leadIntentEnum("intent").notNull(),
+  objection: text("objection"),
+  // « Ce que je ferais à ta place. » Distincte de `objection`, qui constate un
+  // frein : celle-ci dit quoi FAIRE. Nullable — les analyses antérieures n'en
+  // ont pas, et l'écran retombe alors sur la recommandation déduite des faits.
+  recommendation: text("recommendation"),
+  // Température PROPOSÉE (0156) : jamais appliquée seule, un humain clique
+  // « Appliquer ». La preuve est la phrase ou le fait qui la justifie, pour
+  // qu'on puisse la contredire. Nullables : les lectures antérieures n'en ont pas.
+  suggestedTemperature: temperatureEnum("suggested_temperature"),
+  temperatureProof: text("temperature_proof"),
+  // L'action en quelques mots (« l'appeler aujourd'hui ») ; `recommendation`
+  // en donne l'angle en une phrase.
+  nextAction: text("next_action"),
+  // Les signaux WhatsApp CALCULÉS au moment de la lecture (pas par le modèle) :
+  // [{ sens: "chaud" | "froid" | "frein", label }]. Affichés tels quels.
+  waSignals: jsonb("wa_signals").$type<{ sens: "chaud" | "froid" | "frein"; label: string }[]>(),
+  // Empreinte de ce qui a été analysé : si rien n'a changé, on ne repaie pas.
+  sourceHash: text("source_hash").notNull(),
+  model: text("model").notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+export type LeadInsight = typeof leadInsights.$inferSelect;
+
+export type AllowedEmail = typeof allowedEmails.$inferSelect;
+export type NewAllowedEmail = typeof allowedEmails.$inferInsert;
+export type WpConnection = typeof wpConnection.$inferSelect;
+export type NewWpConnection = typeof wpConnection.$inferInsert;
+export type Campaign = typeof campaigns.$inferSelect;
+export type NewCampaign = typeof campaigns.$inferInsert;
+export type CampaignRecipient = typeof campaignRecipients.$inferSelect;
+export type NewCampaignRecipient = typeof campaignRecipients.$inferInsert;
+export type CampaignLinkClick = typeof campaignLinkClicks.$inferSelect;
+
+// ── « Ceux qui entrent dans cette colonne reçoivent ce tag » ──
+// Migration 0123. Indépendant de l'automatisation d'email : une colonne peut
+// taguer sans envoyer, envoyer sans taguer, ou les deux.
+
+export const stageTags = pgTable("stage_tags", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  // Unique en base : un double clic ne crée pas deux règles pour une colonne.
+  statusId: uuid("status_id")
+    .notNull()
+    .unique()
+    .references(() => leadStatuses.id, { onDelete: "cascade" }),
+  tagId: uuid("tag_id")
+    .notNull()
+    .references(() => tags.id, { onDelete: "cascade" }),
+  active: boolean("active").notNull().default(true),
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+export type StageTag = typeof stageTags.$inferSelect;
+
+// ── Automatisation d'une colonne ───────────────────────
+// « Un lead entre dans cette colonne » → il reçoit un modèle d'email.
+// Migration 0120. Recréé après le retrait du 2026-09-01, avec deux garde-fous
+// portés par des index uniques : une règle par colonne, un envoi par lead.
+
+export const automationRunStatusEnum = pgEnum("automation_run_status", [
+  "pending", // en file d'attente, échéance pas encore atteinte
+  "sent",
+  "skipped",
+  "failed",
+  "cancelled", // le lead a quitté la colonne avant l'échéance
+]);
+
+export const automations = pgTable("automations", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  bootcampId: uuid("bootcamp_id")
+    .notNull()
+    .references(() => bootcamps.id, { onDelete: "cascade" }),
+  // Colonne déclencheuse. Plusieurs règles par colonne depuis 0142 : une
+  // séquence, c'est plusieurs règles à des moments différents.
+  statusId: uuid("status_id")
+    .notNull()
+    .references(() => leadStatuses.id, { onDelete: "cascade" }),
+  // ── Canal (migration 0128) ──
+  // 'email' | 'whatsapp'. Une contrainte en base garantit qu'une règle porte
+  // bien le modèle de son canal : sans elle, une règle sans modèle du tout
+  // serait silencieusement inerte.
+  channel: text("channel").notNull().default("email"),
+  // Nul pour une règle WhatsApp.
+  emailTemplateId: uuid("email_template_id").references(() => emailTemplates.id),
+  // Le nom du modèle approuvé par Meta, et la langue déclarée avec lui.
+  whatsappTemplate: text("whatsapp_template"),
+  whatsappLanguage: text("whatsapp_language").notNull().default("fr"),
+  // Les NOMS des variables du CRM, dans l'ordre où Meta les attend : ses
+  // modèles portent {{1}}, {{2}}… donc c'est la POSITION qui fait le lien.
+  whatsappVariables: jsonb("whatsapp_variables").notNull().default([]),
+  // 0 = envoi immédiat à l'entrée. Sinon file d'attente, vidée toutes les
+  // ~15 min : la précision est au quart d'heure, pas à la minute.
+  delayMinutes: integer("delay_minutes").notNull().default(0),
+  // « J+3 à 18 h » (heure locale) : quand atHour est posé, il prime sur
+  // delayMinutes — l'envoi part le jour d'entrée + delayDays, à atHour.
+  delayDays: integer("delay_days").notNull().default(0),
+  atHour: integer("at_hour"),
+  active: boolean("active").notNull().default(true),
+  // Posé quand la règle s'est arrêtée TOUTE SEULE (Meta a mis son modèle en
+  // pause) ; effacé quand quelqu'un la réactive.
+  pausedReason: text("paused_reason"),
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// Journal de TOUTES les tentatives, y compris ignorées et échouées. C'est ce
+// qui rend le volume visible : sans lui, un envoi reporté sur le plafond
+// quotidien disparaîtrait sans trace.
+export const automationRuns = pgTable("automation_runs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  automationId: uuid("automation_id")
+    .notNull()
+    .references(() => automations.id, { onDelete: "cascade" }),
+  leadId: uuid("lead_id")
+    .notNull()
+    .references(() => leads.id, { onDelete: "cascade" }),
+  status: automationRunStatusEnum("status").notNull(),
+  reason: text("reason"),
+  // Échéance d'un envoi différé. NULL = envoi immédiat.
+  scheduledAt: timestamp("scheduled_at"),
+  // Date d'envoi RÉELLE, distincte de createdAt (mise en file) : le plafond
+  // quotidien se compte au jour où l'email part, pas au jour où il est programmé.
+  sentAt: timestamp("sent_at"),
+  // ── Suivi Resend (migration 0121) ──
+  // L'identifiant rendu par Resend à l'envoi. C'est LUI qui permet au webhook
+  // de rattacher « ouvert » ou « cliqué » à la bonne ligne : sans lui, les
+  // événements arrivaient et étaient jetés en silence.
+  resendId: text("resend_id"),
+  // L'équivalent pour WhatsApp — le « wamid » rendu par Meta à l'envoi.
+  whatsappId: text("whatsapp_id"),
+  deliveredAt: timestamp("delivered_at"),
+  // Première réaction + nombre de fois, comme pour les campagnes.
+  openedAt: timestamp("opened_at"),
+  openCount: integer("open_count").notNull().default(0),
+  clickedAt: timestamp("clicked_at"),
+  clickCount: integer("click_count").notNull().default(0),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// Un clic = une ligne. Agréger par URL répond à « quel lien a marché » —
+// la seule mesure qui dise si la vidéo est réellement regardée.
+export const automationLinkClicks = pgTable("automation_link_clicks", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  automationId: uuid("automation_id")
+    .notNull()
+    .references(() => automations.id, { onDelete: "cascade" }),
+  runId: uuid("run_id").references(() => automationRuns.id, { onDelete: "set null" }),
+  url: text("url").notNull(),
+  clickedAt: timestamp("clicked_at").notNull().defaultNow(),
+});
+
+export type Automation = typeof automations.$inferSelect;
+export type NewAutomation = typeof automations.$inferInsert;
+export type AutomationRun = typeof automationRuns.$inferSelect;
+export type AutomationLinkClick = typeof automationLinkClicks.$inferSelect;
+
+// ── Assistant conversationnel ──────────────────────────
+// Migration 0127. Un fil par utilisateur : deux membres ne partagent pas
+// leurs échanges. Les appels d'outils ne sont PAS conservés — seul ce qui a été
+// dit et répondu a besoin de survivre au rafraîchissement.
+export const assistantMessages = pgTable("assistant_messages", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userEmail: text("user_email").notNull(),
+  role: text("role").notNull(), // 'user' | 'assistant'
+  content: text("content").notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+export type AssistantMessage = typeof assistantMessages.$inferSelect;
+
+// La page « WhatsApp » : l'état d'une conversation, à côté du lead et non
+// dedans. Une ligne n'existe qu'une fois la conversation ouverte par un humain.
+// `readAt` = dernière ouverture ; un message reçu après est « non lu ». Partagé
+// par toute l'équipe : c'est la boîte de l'école, pas celle d'une personne.
+// (Table séparée plutôt qu'une colonne sur `leads` : un ALTER de `leads` attend
+// un verrou exclusif que des sessions oisives du pooler ne rendent jamais.)
+export const whatsappConversations = pgTable("whatsapp_conversations", {
+  leadId: uuid("lead_id")
+    .primaryKey()
+    .references(() => leads.id, { onDelete: "cascade" }),
+  readAt: timestamp("read_at"),
+  archivedAt: timestamp("archived_at"), // NULL = visible ; un message reçu la remet à NULL
+  assignedTo: text("assigned_to"), // l'email du membre qui suit la conversation (0161)
+});
+
+// Réglages du service WhatsApp — ligne unique. `aiReplyEnabled` est lu par la
+// réponse automatique (lot 3) ; tant qu'elle n'existe pas, il ne fait rien.
+export const whatsappSettings = pgTable("whatsapp_settings", {
+  id: boolean("id").primaryKey().default(true),
+  aiReplyEnabled: boolean("ai_reply_enabled").notNull().default(false),
+  // Bienvenue : au premier message d'un numéro. Absence : hors horaires (heure
+  // locale, jours ISO 1-7), au plus une fois par 24 h par conversation.
+  welcomeEnabled: boolean("welcome_enabled").notNull().default(false),
+  welcomeText: text("welcome_text").notNull().default(""),
+  awayEnabled: boolean("away_enabled").notNull().default(false),
+  awayText: text("away_text").notNull().default(""),
+  awayStart: integer("away_start").notNull().default(9),
+  awayEnd: integer("away_end").notNull().default(18),
+  awayDays: text("away_days").notNull().default("1,2,3,4,5"),
+  // Assistant WhatsApp (0151) : 'off' | 'repetition' (rédige et se note, n'envoie
+  // rien) | 'auto' (envoie au-dessus du seuil). Remplace aiReplyEnabled, resté inerte.
+  aiMode: text("ai_mode").notNull().default("off"),
+  aiThreshold: integer("ai_threshold").notNull().default(90),
+  aiInstructions: text("ai_instructions").notNull().default(""),
+  // Numéros auxquels l'assistant répond seul, même en répétition (0157).
+  aiTesters: text("ai_testers").notNull().default(""),
+  // Rappels d'échéance (0163) : interrupteur et moments, en jours par rapport à l'échéance (-3 = 3 jours avant).
+  remindersEnabled: boolean("reminders_enabled").notNull().default(true),
+  reminderOffsets: integer("reminder_offsets").array().notNull().default([-3, 0, 3]),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// Les codes promo gérés dans le CRM (0155). Remises en pourcentage ; une remise
+// « facilité » vide = code non valable en paiement en plusieurs fois.
+export const promoCodes = pgTable("promo_codes", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  code: text("code").notNull().unique(),
+  label: text("label").notNull().default(""),
+  source: text("source").notNull().default(""),
+  remiseTotalPct: numeric("remise_total_pct"),
+  remiseFacilitePct: numeric("remise_facilite_pct"),
+  validFrom: date("valid_from"),
+  validUntil: date("valid_until"),
+  bootcampIds: jsonb("bootcamp_ids").notNull().default([]),
+  assistantPeutProposer: boolean("assistant_peut_proposer").notNull().default(false),
+  actif: boolean("actif").notNull().default(true),
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// Chaque message traité par l'assistant WhatsApp (0152) : réponse proposée,
+// note sur 100, décision (pret | escalade | ignore), ce qui est parti.
+export const aiReplies = pgTable("ai_replies", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  leadId: uuid("lead_id")
+    .notNull()
+    .references(() => leads.id, { onDelete: "cascade" }),
+  inboundActivityId: uuid("inbound_activity_id").references(() => activities.id, { onDelete: "set null" }),
+  question: text("question").notNull(),
+  draft: text("draft").notNull().default(""),
+  score: integer("score").notNull().default(0),
+  decision: text("decision").notNull(),
+  raisons: text("raisons").notNull().default(""),
+  sentText: text("sent_text"),
+  sentWamid: text("sent_wamid"),
+  humanReply: text("human_reply"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// Ce qu'on donne à l'assistant WhatsApp (0151) : texte, fichier (texte extrait),
+// lien (texte de la page), souvenir (réponse humaine validée).
+export const aiKnowledge = pgTable("ai_knowledge", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  kind: text("kind").notNull(), // texte | fichier | lien | souvenir | lecon (règle de l'équipe) | style
+  title: text("title").notNull(),
+  content: text("content").notNull(),
+  source: text("source"), // nom du fichier ou adresse du lien
+  status: text("status").notNull().default("actif"), // actif | a_valider | archive
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// Le statut d'un WhatsApp envoyé (✓ / ✓✓ / lu / échec), rattaché à sa bulle
+// par `activityId` et à Meta par `wamid`. Alimenté par le webhook.
+export const whatsappMessages = pgTable("whatsapp_messages", {
+  wamid: text("wamid").primaryKey(),
+  activityId: uuid("activity_id")
+    .notNull()
+    .references(() => activities.id, { onDelete: "cascade" }),
+  // Le nom du modèle envoyé (0143) : un bouton tapé cite ce wamid, et c'est
+  // par là qu'on retrouve l'action à faire.
+  template: text("template"),
+  status: text("status").notNull().default("sent"), // sent | delivered | read | failed | received
+  error: text("error"),
+  replyToWamid: text("reply_to_wamid"), // le message cité, dans un sens ou dans l'autre
+  reactionLead: text("reaction_lead"), // l'emoji du lead sur ce message
+  reactionUs: text("reaction_us"), // le nôtre sur le sien
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// Les réponses rapides de la page Messages : « /prix » → un texte prêt.
+// Ce qu'un tap sur un bouton de modèle déclenche dans le CRM (0143).
+export const whatsappButtonActions = pgTable("whatsapp_button_actions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  template: text("template").notNull(),
+  buttonText: text("button_text").notNull(),
+  tagId: uuid("tag_id").references(() => tags.id, { onDelete: "set null" }),
+  replyText: text("reply_text"),
+  // now | evening | tomorrow
+  callSlot: text("call_slot"),
+  optOut: boolean("opt_out").notNull().default(false),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// Un envoi en masse : UN modèle vers tous les leads d'une colonne, à l'instant
+// où on clique (les automatisations, elles, se déclenchent à l'entrée). La file
+// est vidée par le même cron : on n'envoie jamais 200 messages d'un bloc.
+export const whatsappBlasts = pgTable("whatsapp_blasts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  bootcampId: uuid("bootcamp_id")
+    .notNull()
+    .references(() => bootcamps.id, { onDelete: "cascade" }),
+  statusId: uuid("status_id")
+    .notNull()
+    .references(() => leadStatuses.id, { onDelete: "cascade" }),
+  template: text("template").notNull(),
+  language: text("language").notNull().default("ar"),
+  variables: jsonb("variables").notNull().default([]),
+  // Que faire de ceux qui ont déjà reçu un marketing il y a moins de 24 h :
+  // 'reporter' (ils l'auront à l'échéance) ou 'exclure' (ils sautent la vague).
+  capPolicy: text("cap_policy").notNull().default("reporter"),
+  // Modèle avec le formulaire d'inscription : la session où les inscrits arrivent (0150).
+  targetBootcampId: uuid("target_bootcamp_id").references(() => bootcamps.id, { onDelete: "set null" }),
+  // running | paused | done
+  state: text("state").notNull().default("running"),
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  finishedAt: timestamp("finished_at"),
+});
+
+// Une ligne par destinataire : c'est elle qui rend l'envoi repayable et lisible
+// (qui a reçu, qui a été sauté et pourquoi).
+export const whatsappBlastTargets = pgTable(
+  "whatsapp_blast_targets",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    blastId: uuid("blast_id")
+      .notNull()
+      .references(() => whatsappBlasts.id, { onDelete: "cascade" }),
+    leadId: uuid("lead_id")
+      .notNull()
+      .references(() => leads.id, { onDelete: "cascade" }),
+    // pending | sent | skipped | failed
+    status: text("status").notNull().default("pending"),
+    reason: text("reason"),
+    // Posé sur un reporté : l'heure à laquelle son plafond 24 h se libère.
+    scheduledAt: timestamp("scheduled_at"),
+    sentAt: timestamp("sent_at"),
+    whatsappId: text("whatsapp_id"),
+  },
+  (t) => [unique("whatsapp_blast_targets_unique").on(t.blastId, t.leadId)]
+);
+
+export const whatsappQuickReplies = pgTable("whatsapp_quick_replies", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  shortcut: text("shortcut").notNull().unique(),
+  text: text("text").notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// Une pièce jointe WhatsApp (photo, vidéo, PDF, vocal, sticker), rapatriée
+// dans le bucket public `whatsapp-media` et rattachée à sa bulle.
+export const whatsappMedia = pgTable("whatsapp_media", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  activityId: uuid("activity_id")
+    .notNull()
+    .references(() => activities.id, { onDelete: "cascade" }),
+  kind: text("kind").notNull(), // image | video | audio | document | sticker
+  mimeType: text("mime_type"),
+  url: text("url").notNull(),
+  storagePath: text("storage_path").notNull(),
+  filename: text("filename"),
+  size: integer("size"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// Liens WhatsApp de suivi par source (0160) — cf. src/lib/whatsapp-links.ts.
+export const whatsappLinks = pgTable("whatsapp_links", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  nom: text("nom").notNull(),
+  code: text("code").notNull().unique(),
+  message: text("message").notNull(),
+  sourceId: uuid("source_id").references(() => leadSources.id, { onDelete: "set null" }),
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// Notifications Web Push (0167) — cf. src/lib/push.ts.
+export const pushSubscriptions = pgTable("push_subscriptions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userEmail: text("user_email").notNull(),
+  endpoint: text("endpoint").notNull().unique(),
+  p256dh: text("p256dh").notNull(),
+  auth: text("auth").notNull(),
+  events: text("events").array().notNull().default(["message", "escalade", "attribue", "tache"]),
+  appareil: text("appareil"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// L'école (ligne unique) : nom, description, langue — lus par les prompts de
+// l'IA — et le lieu, pour le bouton « Envoyer la localisation » sur WhatsApp.
+export const organisation = pgTable("organisation", {
+  id: boolean("id").primaryKey().default(true),
+  nom: text("nom").notNull().default(""),
+  description: text("description").notNull().default(""),
+  langue: text("langue").notNull().default(""),
+  adresse: text("adresse").notNull().default(""),
+  latitude: doublePrecision("latitude"),
+  longitude: doublePrecision("longitude"),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});

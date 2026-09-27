@@ -1,0 +1,435 @@
+"use client";
+
+import { useState, useTransition, useEffect, useRef } from "react";
+import { useRouter } from "next/navigation";
+import { HugeiconsIcon } from "@hugeicons/react";
+import { MoreHorizontalIcon } from "@hugeicons/core-free-icons";
+import {
+  updateBootcampFieldAction,
+  deleteBootcampAction,
+  setBootcampArchivedAction,
+  duplicateBootcampAction,
+} from "@/app/actions";
+
+// Contrôle d'une formation SANS ouvrir sa page : statut, réglages, suppression.
+// Le composant est un frère du <Link> de la carte (pas un enfant) : un clic ici
+// ne déclenche donc jamais la navigation.
+
+type Editable = {
+  id: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  startDate: string | null;
+  endDate: string | null;
+  status: string;
+  capacity: number | null;
+  currency: string;
+  priceTotal: string | null;
+  monthlyCount: number | null;
+  monthlyAmount: string | null;
+  archived: boolean;
+};
+
+const STATUSES = [
+  { value: "draft", label: "Brouillon" },
+  { value: "open", label: "Ouvert" },
+  { value: "in_progress", label: "En cours" },
+  { value: "completed", label: "Terminé" },
+  { value: "cancelled", label: "Annulé" },
+];
+
+export function BootcampCardMenu({
+  bootcamp,
+  canDelete,
+  offre,
+}: {
+  bootcamp: Editable;
+  canDelete: boolean;
+  /** Le prix catalogue demande « argent : gérer » : sans lui, ni champs ni envoi. */
+  offre: boolean;
+}) {
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showDelete, setShowDelete] = useState(false);
+  const [showDuplicate, setShowDuplicate] = useState(false);
+  const [duplicateError, setDuplicateError] = useState<string | null>(null);
+  // Valeurs écrites à la main recopiées dans la nouvelle formation : à relire.
+  const [aVerifier, setAVerifier] = useState<{ id: string; lignes: string[] } | null>(null);
+  const [isPending, startTransition] = useTransition();
+  const ref = useRef<HTMLDivElement>(null);
+
+  // Referme au clic extérieur — sinon le menu reste ouvert par-dessus les autres cartes.
+  useEffect(() => {
+    if (!open) return;
+    function onDown(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  function setStatus(value: string) {
+    startTransition(async () => {
+      await updateBootcampFieldAction(bootcamp.id, "status", value);
+      setOpen(false);
+      router.refresh();
+    });
+  }
+
+  function toggleArchive() {
+    startTransition(async () => {
+      await setBootcampArchivedAction(bootcamp.id, !bootcamp.archived);
+      setOpen(false);
+      router.refresh();
+    });
+  }
+
+  function remove() {
+    startTransition(async () => {
+      await deleteBootcampAction(bootcamp.id);
+      setShowDelete(false);
+      router.refresh();
+    });
+  }
+
+  function duplicate(formData: FormData) {
+    setDuplicateError(null);
+    startTransition(async () => {
+      const r = await duplicateBootcampAction(bootcamp.id, formData);
+      if (!r.ok || !r.id) return setDuplicateError(r.message);
+      if (r.aVerifier?.length) return setAVerifier({ id: r.id, lignes: r.aVerifier });
+      setShowDuplicate(false);
+      router.push(`/bootcamps/${r.id}`);
+    });
+  }
+
+  // `updateBootcampFieldAction` transforme une valeur vide en NULL. Or name,
+  // slug et currency sont NOT NULL en base : les envoyer vides ferait planter
+  // la requête. On ne les transmet donc que s'ils ont une valeur.
+  const NON_NULLABLE = new Set(["name", "slug", "currency"]);
+
+  function saveSettings(formData: FormData) {
+    startTransition(async () => {
+      // Un appel par champ : l'action serveur valide champ par champ (whitelist).
+      for (const field of [
+        "name",
+        "slug",
+        "description",
+        "startDate",
+        "endDate",
+        "capacity",
+        "currency",
+        ...(offre ? ["priceTotal", "monthlyCount", "monthlyAmount"] : []),
+      ]) {
+        const value = String(formData.get(field) ?? "").trim();
+        if (!value && NON_NULLABLE.has(field)) continue;
+        await updateBootcampFieldAction(bootcamp.id, field, value);
+      }
+      setShowSettings(false);
+      router.refresh();
+    });
+  }
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        aria-label={`Actions pour ${bootcamp.name}`}
+        onClick={() => setOpen((v) => !v)}
+        className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+      >
+        <HugeiconsIcon icon={MoreHorizontalIcon} size={16} />
+      </button>
+
+      {open && (
+        <div className="absolute right-0 top-8 z-30 w-52 rounded-lg border border-border bg-card p-1 shadow-lg">
+          <p className="px-2 pb-1 pt-1.5 text-[12px] font-medium uppercase tracking-wide text-muted-foreground/70">
+            Statut
+          </p>
+          {STATUSES.map((s) => (
+            <button
+              key={s.value}
+              onClick={() => setStatus(s.value)}
+              disabled={isPending}
+              className={`flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left text-xs hover:bg-muted disabled:opacity-40 ${
+                bootcamp.status === s.value ? "font-medium text-foreground" : "text-muted-foreground"
+              }`}
+            >
+              {s.label}
+              {bootcamp.status === s.value && <span className="text-[12px]">●</span>}
+            </button>
+          ))}
+
+          <div className="my-1 border-t border-border" />
+
+          <button
+            onClick={() => {
+              setOpen(false);
+              setShowSettings(true);
+            }}
+            className="w-full rounded-md px-2 py-1.5 text-left text-xs text-foreground hover:bg-muted"
+          >
+            Paramétrer…
+          </button>
+
+          <button
+            onClick={() => {
+              setOpen(false);
+              setShowDuplicate(true);
+            }}
+            title="Nouvelle session avec les mêmes colonnes, automatisations et formulaires"
+            className="w-full rounded-md px-2 py-1.5 text-left text-xs text-foreground hover:bg-muted"
+          >
+            Dupliquer pour la session suivante…
+          </button>
+
+          <button
+            onClick={toggleArchive}
+            disabled={isPending}
+            title={
+              bootcamp.archived
+                ? "Réafficher cette formation dans la liste"
+                : "Ranger la formation sans rien supprimer — ses formulaires cessent d'importer"
+            }
+            className="w-full rounded-md px-2 py-1.5 text-left text-xs text-foreground hover:bg-muted disabled:opacity-40"
+          >
+            {bootcamp.archived ? "Désarchiver" : "Archiver"}
+          </button>
+
+          <button
+            onClick={() => {
+              setOpen(false);
+              if (canDelete) setShowDelete(true);
+            }}
+            disabled={!canDelete}
+            title={canDelete ? undefined : "La formation par défaut ne peut pas être supprimée."}
+            className="w-full rounded-md px-2 py-1.5 text-left text-xs text-red-500 hover:bg-red-50 disabled:cursor-not-allowed disabled:text-muted-foreground/70 disabled:hover:bg-transparent"
+          >
+            Supprimer
+          </button>
+        </div>
+      )}
+
+      {showSettings && (
+        <Modal title={`Paramétrer — ${bootcamp.name}`} onClose={() => setShowSettings(false)}>
+          <form action={saveSettings} className="space-y-3">
+            <Field label="Nom" name="name" defaultValue={bootcamp.name} required />
+            <Field label="Slug (URL)" name="slug" defaultValue={bootcamp.slug} required />
+            <Field
+              label="Description"
+              name="description"
+              defaultValue={bootcamp.description ?? ""}
+            />
+            <div className="grid grid-cols-2 gap-3">
+              <Field
+                label="Date de début"
+                name="startDate"
+                type="date"
+                defaultValue={bootcamp.startDate?.slice(0, 10) ?? ""}
+              />
+              <Field
+                label="Date de fin"
+                name="endDate"
+                type="date"
+                defaultValue={bootcamp.endDate?.slice(0, 10) ?? ""}
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <Field
+                label="Places"
+                name="capacity"
+                type="number"
+                defaultValue={bootcamp.capacity != null ? String(bootcamp.capacity) : ""}
+              />
+              <Field label="Devise" name="currency" defaultValue={bootcamp.currency} required />
+            </div>
+
+            {offre && (
+            <div className="border-t border-border pt-3">
+              <p className="mb-2 text-[12px] font-medium uppercase tracking-wide text-muted-foreground">
+                Offre &amp; paiement
+              </p>
+              <div className="grid grid-cols-3 gap-3">
+                <Field
+                  label="Prix total"
+                  name="priceTotal"
+                  defaultValue={bootcamp.priceTotal ?? ""}
+                />
+                <Field
+                  label="Nb mois"
+                  name="monthlyCount"
+                  type="number"
+                  defaultValue={bootcamp.monthlyCount != null ? String(bootcamp.monthlyCount) : ""}
+                />
+                <Field
+                  label="Par mois"
+                  name="monthlyAmount"
+                  defaultValue={bootcamp.monthlyAmount ?? ""}
+                />
+              </div>
+            </div>
+            )}
+
+            <div className="flex gap-2 pt-1">
+              <button
+                type="submit"
+                disabled={isPending}
+                className="rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-50"
+              >
+                {isPending ? "Enregistrement…" : "Enregistrer"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowSettings(false)}
+                className="rounded-lg border border-border px-3 py-1.5 text-xs text-foreground"
+              >
+                Annuler
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {showDuplicate && (
+        <Modal title={`Dupliquer — ${bootcamp.name}`} onClose={() => setShowDuplicate(false)}>
+          {aVerifier ? (
+            <div className="space-y-3">
+              <p className="text-xs text-foreground">✓ Formation créée.</p>
+              <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-[12.5px] text-amber-900">
+                <p className="font-medium">
+                  ⚠️ Valeurs écrites à la main, recopiées telles quelles : à vérifier dans les automatisations de
+                  la nouvelle formation.
+                </p>
+                <ul className="mt-1.5 list-disc space-y-0.5 pl-4">
+                  {aVerifier.lignes.map((l) => (
+                    <li key={l}>{l}</li>
+                  ))}
+                </ul>
+              </div>
+              <button
+                onClick={() => {
+                  setShowDuplicate(false);
+                  router.push(`/bootcamps/${aVerifier.id}`);
+                }}
+                className="rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground"
+              >
+                Ouvrir la nouvelle formation
+              </button>
+            </div>
+          ) : (
+          <form action={duplicate} className="space-y-3">
+            <Field label="Nom de la nouvelle formation" name="name" defaultValue="" required />
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Date de début" name="startDate" type="date" defaultValue="" />
+              <Field label="Date de fin" name="endDate" type="date" defaultValue="" />
+            </div>
+            <ul className="space-y-1 rounded-lg bg-muted/50 p-3 text-[12.5px] text-muted-foreground">
+              <li>✓ Copiés : prix, colonnes, automatisations, tags de colonne.</li>
+              <li>
+                ➜ Les formulaires du site <strong className="text-foreground">passent sur la nouvelle</strong> :
+                les prochains inscrits y arrivent directement.
+              </li>
+              <li>• Aucun lead ne bouge : ils restent dans « {bootcamp.name} ».</li>
+            </ul>
+            {duplicateError && <p className="text-xs text-red-600">{duplicateError}</p>}
+            <div className="flex gap-2 pt-1">
+              <button
+                type="submit"
+                disabled={isPending}
+                className="rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground disabled:opacity-50"
+              >
+                {isPending ? "Création…" : "Créer la nouvelle formation"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowDuplicate(false)}
+                className="rounded-lg border border-border px-3 py-1.5 text-xs text-foreground"
+              >
+                Annuler
+              </button>
+            </div>
+          </form>
+          )}
+        </Modal>
+      )}
+
+      {showDelete && (
+        <Modal title="Supprimer cette formation ?" onClose={() => setShowDelete(false)}>
+          <p className="text-xs text-muted-foreground">
+            <strong className="text-foreground">{bootcamp.name}</strong> sera supprimée.
+            Ses leads ne sont pas détruits : ils sont réaffectés à la formation par
+            défaut. Les colonnes du pipeline de cette formation, elles, disparaissent.
+          </p>
+          <div className="mt-4 flex gap-2">
+            <button
+              onClick={remove}
+              disabled={isPending}
+              className="rounded-lg bg-red-500 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
+            >
+              {isPending ? "Suppression…" : "Supprimer"}
+            </button>
+            <button
+              onClick={() => setShowDelete(false)}
+              className="rounded-lg border border-border px-3 py-1.5 text-xs text-foreground"
+            >
+              Annuler
+            </button>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function Modal({
+  title,
+  onClose,
+  children,
+}: {
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-xl border border-border bg-card p-5 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="mb-4 text-sm font-semibold text-foreground font-heading">{title}</h2>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Field({
+  label,
+  name,
+  defaultValue,
+  type = "text",
+  required,
+}: {
+  label: string;
+  name: string;
+  defaultValue: string;
+  type?: string;
+  required?: boolean;
+}) {
+  return (
+    <div>
+      <label className="mb-1 block text-xs font-medium text-muted-foreground">{label}</label>
+      <input
+        name={name}
+        type={type}
+        required={required}
+        defaultValue={defaultValue}
+        className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-ring"
+      />
+    </div>
+  );
+}

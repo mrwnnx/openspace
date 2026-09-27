@@ -1,0 +1,256 @@
+import Link from "next/link";
+import { notFound } from "next/navigation";
+import { ArrowLeft01Icon, Clock01Icon, Analytics01Icon,
+  Message01Icon,
+} from "@hugeicons/core-free-icons";
+import { HugeiconsIcon } from "@hugeicons/react";
+import { getBootcampById, getLeadsKanban, getLeadSources, getFormSourcesByBootcamp, getTags, getLeadStatuses, countLeadsToAnalyze, getInsightsByBootcamp, getReturningByBootcamp, getMultiFormByBootcamp,
+  getEngagedByBootcamp, getCalledByBootcamp, getOpenBootcamps, getCarryCandidates, getAutomationsByBootcamp,
+  getStageTagsByBootcamp, getEmailTemplates } from "@/lib/queries";
+import { LeadsKanban } from "@/components/leads/leads-kanban";
+import { cn, formatDate, statusColor } from "@/lib/utils";
+import { NewLeadButton } from "@/components/leads/new-lead-button";
+import { AnalyzeLeadsButton } from "@/components/bootcamps/analyze-leads-button";
+import { ImportFormsButton } from "@/components/bootcamps/import-forms-button";
+import { BootcampMenu } from "@/components/bootcamps/bootcamp-menu";
+import { a, exigerPageUnDe, sansMontants } from "@/lib/droits";
+
+export const dynamic = "force-dynamic";
+
+const statusLabels: Record<string, string> = {
+  draft: "Brouillon",
+  open: "Ouvert",
+  in_progress: "En cours",
+  completed: "Terminé",
+  cancelled: "Annulé",
+};
+
+const statusColors: Record<string, string> = {
+  draft: "gray",
+  open: "blue",
+  in_progress: "green",
+  completed: "purple",
+  cancelled: "red",
+};
+
+export default async function BootcampDetailPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const droits = await exigerPageUnDe(["leads", "formations"]);
+  const voirArgent = a(droits, "argent", "voir");
+  const peut = {
+    leads: a(droits, "leads", "gerer"),
+    formation: a(droits, "formations", "gerer"),
+    argent: a(droits, "argent", "gerer"),
+    campagnes: a(droits, "campagnes", "gerer"),
+  };
+  const { id } = await params;
+  const [bootcampBrut, kanbanData, sources, formSources, tags, pipelineStatuses, aiData, carry] =
+    await Promise.all([
+      getBootcampById(id),
+      getLeadsKanban(id),
+      getLeadSources(),
+      getFormSourcesByBootcamp(id),
+      getTags(),
+      getLeadStatuses(id),
+      // Même principe : deux requêtes dans UNE branche, pas deux de plus en front.
+      (async () => ({
+        pending: await countLeadsToAnalyze(id),
+        insights: await getInsightsByBootcamp(id),
+        returning: await getReturningByBootcamp(id),
+        multiForm: await getMultiFormByBootcamp(id),
+        engaged: await getEngagedByBootcamp(id),
+        called: await getCalledByBootcamp(id),
+      }))(),
+      // Formations pouvant recevoir un report + les candidats vers la première.
+      (async () => {
+        const targets = await getOpenBootcamps(id);
+        const candidates = targets[0] ? await getCarryCandidates(id, targets[0].id) : [];
+        return { targets, candidates };
+      })(),
+    ]);
+
+  if (!bootcampBrut) notFound();
+  // Sans le droit « argent », les prix ne partent pas vers le navigateur.
+  const bootcamp = voirArgent ? bootcampBrut : sansMontants(bootcampBrut);
+
+  // Règles d'automatisation des colonnes + modèles d'email de l'écran.
+  // Chargés APRÈS le Promise.all, EN SÉRIE : la page tire déjà 8 requêtes en
+  // parallèle et le pool est à 10 (src/db/index.ts). Deux de plus en parallèle
+  // frôleraient le seuil où le pooler transaction fige les connexions.
+  const columnAutomations = await getAutomationsByBootcamp(id);
+  const stageTagRules = await getStageTagsByBootcamp(id);
+  // Seuls id/nom/objet partent au client : le contenu des modèles n'y sert pas.
+  const emailTemplates = (await getEmailTemplates()).map((t) => ({
+    id: t.id,
+    name: t.name,
+    subject: t.subject,
+  }));
+
+  const totalLeads = kanbanData.reduce((sum, s) => sum + s.leads.length, 0);
+  // La capacité se compare aux INSCRITS (colonnes « converti »), pas aux leads.
+  const inscrits = kanbanData.filter((s) => s.kind === "converted").reduce((sum, s) => sum + s.leads.length, 0);
+
+  // « Non traité » = arrivé par un import et JAMAIS ouvert (seenAt null).
+  // Remplace l'ancienne règle des 24 h, qui s'éteignait toute seule même si
+  // personne n'avait rien fait du lead : le marqueur survit maintenant aux
+  // absences et ne part qu'à l'ouverture de la fiche.
+  // Formation terminée, annulée ou archivée : plus rien à relancer, pas de ⏰.
+  const close = !!bootcamp.archivedAt || bootcamp.status === "completed" || bootcamp.status === "cancelled";
+  const kanbanWithFlags = kanbanData.map((stage) => ({
+    ...stage,
+    leads: stage.leads.map((l) => ({
+      ...(voirArgent ? l : sansMontants(l)),
+      sansActionJours: close ? null : l.sansActionJours,
+      isNew: !!l.formSourceId && l.seenAt === null,
+      insight: aiData.insights.get(l.id) ?? null,
+      returning: aiData.returning.get(l.id) ?? null,
+      multiForm: aiData.multiForm.has(l.id),
+      engaged: aiData.engaged.get(l.id) ?? null,
+      called: aiData.called.has(l.id),
+    })),
+  }));
+
+  // Seules les sources liées à un formulaire Elementor (pull par API) sont
+  // affichées. Les sources webhook (push) n'ont plus d'écran depuis 2026-08-06 :
+  // l'endpoint /api/webhook/forms/[token] existe toujours et fonctionne, mais
+  // aucune source ne s'y crée par l'UI.
+  // ⚠️ Délier = soft delete (active=false) : la ligne reste en base pour libérer
+  // le formulaire. Sans le filtre `active`, une source déliée continuait de
+  // s'afficher comme liée — le même formulaire semblait rattaché à 2 formations.
+  const elementorSources = formSources.filter((s) => s.elementorFormId && s.active);
+
+  return (
+    <div className="flex flex-1 flex-col overflow-hidden">
+      {/* Header — téléphone : le titre sur sa propre ligne, les boutons dessous. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-4 py-3 md:flex-nowrap">
+        <Link
+          href="/bootcamps"
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <HugeiconsIcon icon={ArrowLeft01Icon} size={16} />
+        </Link>
+        <div className="min-w-0 flex-1 basis-[calc(100%-3rem)] md:basis-auto">
+          <div className="flex items-center gap-2">
+            <h1 className="truncate text-sm font-semibold text-foreground font-heading">
+              {bootcamp.name}
+            </h1>
+            <span
+              className={cn(
+                "rounded-full px-2 py-0.5 text-[12px] font-medium",
+                statusColor(statusColors[bootcamp.status] || "gray")
+              )}
+            >
+              {statusLabels[bootcamp.status] || bootcamp.status}
+            </span>
+          </div>
+          {bootcamp.startDate && (
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {formatDate(bootcamp.startDate)}
+              {bootcamp.endDate && ` → ${formatDate(bootcamp.endDate)}`}
+              {bootcamp.capacity && ` · ${inscrits}/${bootcamp.capacity} inscrits`}
+            </p>
+          )}
+        </div>
+        {/* Trois gestes assez fréquents pour mériter la barre plutôt que le
+            menu : importer, faire lire les nouveaux leads par l'IA, et voir
+            ce qui a été fait sur cette formation. */}
+        {peut.formation && (
+          <ImportFormsButton bootcampId={bootcamp.id} linkedCount={elementorSources.length} />
+        )}
+
+        {peut.leads && <AnalyzeLeadsButton bootcampId={bootcamp.id} pending={aiData.pending} compact />}
+
+        {a(droits, "stats", "voir") && (
+        <Link
+          href={`/bootcamps/${bootcamp.id}/statistiques`}
+          title="Statistiques de cette formation"
+          aria-label="Statistiques de cette formation"
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <HugeiconsIcon icon={Analytics01Icon} size={16} />
+        </Link>
+        )}
+
+        {a(droits, "campagnes", "voir") && (
+        <Link
+          href={`/bootcamps/${bootcamp.id}/envois`}
+          title="Envois WhatsApp de cette formation"
+          aria-label="Envois WhatsApp de cette formation"
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <HugeiconsIcon icon={Message01Icon} size={16} />
+        </Link>
+        )}
+
+        {a(droits, "leads", "voir") && (
+        <Link
+          href={`/bootcamps/${bootcamp.id}/historique`}
+          title="Historique de cette formation"
+          aria-label="Historique de cette formation"
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <HugeiconsIcon icon={Clock01Icon} size={16} />
+        </Link>
+        )}
+
+        {peut.leads && (
+        <NewLeadButton
+          sources={sources}
+          lockedBootcamp={{ id: bootcamp.id, name: bootcamp.name }}
+        />
+        )}
+        {(peut.formation || peut.leads) && (
+        <BootcampMenu
+          droits={{ formation: peut.formation, leads: peut.leads, argent: peut.argent }}
+          bootcamp={bootcamp}
+          linked={elementorSources.map((s) => ({
+            id: s.id,
+            name: s.name,
+            elementorFormId: s.elementorFormId,
+            lastSubmissionId: s.lastSubmissionId,
+            fieldMapping: (s.fieldMapping ?? {}) as Record<string, string>,
+            lastPayload: (s.lastPayload ?? null) as Record<string, string> | null,
+            targetStatusId: s.targetStatusId,
+            defaultTagIds: (s.defaultTagIds ?? []) as string[],
+          }))}
+          stages={pipelineStatuses.map((s) => ({ id: s.id, name: s.name, kind: s.kind }))}
+          tags={tags.map((t) => ({ id: t.id, name: t.name }))}
+          pendingAnalysis={aiData.pending}
+          carryCandidates={carry.candidates}
+          carryTargets={carry.targets.map((b) => ({ id: b.id, name: b.name }))}
+        />
+        )}
+      </div>
+
+      {/* Kanban */}
+      <div className="flex-1 overflow-hidden">
+        {kanbanData.length > 0 ? (
+          <LeadsKanban
+            statuses={kanbanWithFlags}
+            droits={{
+              deplacer: peut.leads,
+              formation: peut.formation,
+              campagnes: peut.campagnes,
+              inscrire: peut.argent,
+            }}
+            bootcamp={bootcamp}
+            automations={columnAutomations}
+            emailTemplates={emailTemplates}
+            stageTags={stageTagRules}
+            tags={tags.map((t) => ({ id: t.id, name: t.name }))}
+            formSources={formSources
+              .filter((f) => f.active)
+              .map((f) => ({ id: f.id, name: f.name }))}
+          />
+        ) : (
+          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+            Aucune colonne dans le pipeline.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

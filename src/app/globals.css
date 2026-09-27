@@ -1,0 +1,188 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+/* Readex Pro, sous-ensemble arabe seulement (fonte variable 160-700, 22 Ko,
+   copiée de Google Fonts le 2026-09-20). Choix de lisibilité : tout texte en
+   arabe s'affiche en Readex Pro. Le unicode-range fait le tri par caractère. */
+@font-face {
+  font-family: "Readex Pro Arabic";
+  font-style: normal;
+  font-weight: 160 700;
+  font-display: swap;
+  src: url("/fonts/readex-pro-arabic.woff2") format("woff2");
+  unicode-range: U+0600-06FF, U+0750-077F, U+0870-088E, U+0890-0891, U+0897-08E1, U+08E3-08FF, U+200C-200E, U+2010-2011, U+204F, U+2E41, U+FB50-FDFF, U+FE70-FE74, U+FE76-FEFC, U+102E0-102FB, U+10E60-10E7E, U+10EC2-10EC4, U+10EFC-10EFF, U+1EE00-1EE03, U+1EE05-1EE1F, U+1EE21-1EE22, U+1EE24, U+1EE27, U+1EE29-1EE32, U+1EE34-1EE37, U+1EE39, U+1EE3B, U+1EE42, U+1EE47, U+1EE49, U+1EE4B, U+1EE4D-1EE4F, U+1EE51-1EE52, U+1EE54, U+1EE57, U+1EE59, U+1EE5B, U+1EE5D, U+1EE5F, U+1EE61-1EE62, U+1EE64, U+1EE67-1EE6A, U+1EE6C-1EE72, U+1EE74-1EE77, U+1EE79-1EE7C, U+1EE7E, U+1EE80-1EE89, U+1EE8B-1EE9B, U+1EEA1-1EEA3, U+1EEA5-1EEA9, U+1EEAB-1EEBB, U+1EEF0-1EEF1;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  /* « Readex Pro Arabic » ne couvre QUE l'arabe (unicode-range) : tout texte
+     arabe passe en Readex Pro, le latin garde Inter / Space Grotesk / Geist. */
+  --font-sans: "Readex Pro Arabic", var(--font-inter);
+  --font-mono: "Readex Pro Arabic", var(--font-geist-mono);
+  --font-heading: "Readex Pro Arabic", var(--font-space-grotesk);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  /* Échelle +2 px (décision du 20/09/2026, contraste + lisibilité) :
+     xs 12→14, sm 14→16, base 16→18, lg 18→20, xl 20→22, 2xl 24→26.
+     Les tailles écrites en dur (text-[10px]…) ont été décalées dans le code. */
+  --text-xs: 14px;
+  --text-xs--line-height: 1.45;
+  --text-sm: 16px;
+  --text-sm--line-height: 1.5;
+  --text-base: 18px;
+  --text-base--line-height: 1.5;
+  --text-lg: 20px;
+  --text-lg--line-height: 1.45;
+  --text-xl: 22px;
+  --text-xl--line-height: 1.4;
+  --text-2xl: 26px;
+  --text-2xl--line-height: 1.3;
+
+  --background: oklch(1 0 0);
+  --foreground: oklch(0 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0 0 0);
+  --primary: oklch(0 0 0);
+  --primary-foreground: oklch(1 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0 0 0);
+  --muted: oklch(0.97 0 0);
+  /* 0.45 (≈ #6B6B6B, 5,3:1 sur blanc) : à 0.556 le gris tombait à 3,5:1,
+     sous le seuil AA, sur 591 usages souvent en 10-11 px. */
+  --muted-foreground: oklch(0.45 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --radius: 0.625rem;
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0 0 0);
+  --sidebar-primary: oklch(0 0 0);
+  --sidebar-primary-foreground: oklch(1 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0 0 0);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+/* ── Zone d'écriture de l'éditeur d'email ──────────────
+   L'éditeur doit ressembler à l'email, pas à un champ de formulaire : mêmes
+   tailles et mêmes couleurs que le rendu final, injectées en variables. */
+.email-canvas .ProseMirror {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+}
+.email-canvas .ProseMirror > * + * { margin-top: 16px; }
+.email-canvas .ProseMirror h1 { font-size: 21px; font-weight: 600; line-height: 1.3; color: var(--email-title); }
+.email-canvas .ProseMirror h2 { font-size: 17px; font-weight: 600; line-height: 1.35; color: var(--email-title); }
+.email-canvas .ProseMirror h3 { font-size: 16px; font-weight: 600; color: var(--email-title); }
+.email-canvas .ProseMirror ul { list-style: disc; padding-left: 20px; }
+.email-canvas .ProseMirror ol { list-style: decimal; padding-left: 20px; }
+.email-canvas .ProseMirror li { margin-bottom: 6px; }
+.email-canvas .ProseMirror li > p { margin: 0; }
+.email-canvas .ProseMirror a { color: var(--email-accent); text-decoration: underline; }
+.email-canvas .ProseMirror img { max-width: 100%; height: auto; border-radius: 8px; }
+.email-canvas .ProseMirror blockquote {
+  padding-left: 14px;
+  border-left: 3px solid rgba(0, 0, 0, 0.12);
+  opacity: 0.85;
+}
+/* Message d'invite quand le document est vide. */
+.email-canvas .ProseMirror p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  pointer-events: none;
+  opacity: 0.45;
+}
+
+
+/* Téléphone seulement (27/09) : tous les textes +1 px, pour lire sans plisser
+   les yeux ; l'ordinateur garde l'échelle du 20/09. Hors @layer exprès : ces
+   règles passent devant les utilitaires de Tailwind, y compris les tailles
+   écrites en dur (text-[12px]…). */
+@media (max-width: 767px) {
+  :root {
+    --text-xs: 15px;
+    --text-sm: 17px;
+    --text-base: 19px;
+    --text-lg: 21px;
+    --text-xl: 23px;
+    --text-2xl: 27px;
+  }
+  .text-\[10px\] { font-size: 11px; }
+  .text-\[11px\] { font-size: 12px; }
+  .text-\[11\.5px\] { font-size: 12.5px; }
+  .text-\[12px\] { font-size: 13px; }
+  .text-\[12\.5px\] { font-size: 13.5px; }
+  .text-\[13px\] { font-size: 14px; }
+  .text-\[13\.5px\] { font-size: 14.5px; }
+  .text-\[14px\] { font-size: 15px; }
+  .text-\[14\.5px\] { font-size: 15.5px; }
+  .text-\[15px\] { font-size: 16px; }
+  .text-\[16px\] { font-size: 17px; }
+  .text-\[18px\] { font-size: 19px; }
+}
+
+/* Barre d'onglets mobile : cachée quand une conversation WhatsApp est ouverte (le champ de réponse prend le bas). */
+main:has([data-fil-ouvert]) > .barre-onglets { display: none; }

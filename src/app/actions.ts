@@ -1,0 +1,3161 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { requireUser } from "@/lib/auth";
+import { exiger, exigerProprietaire, peut } from "@/lib/droits";
+import type { BulkImportResult, BulkImportLeadsOptions } from "@/lib/import-csv";
+import {
+  getBootcampById,
+  createBootcamp as createBootcampQuery,
+  updateBootcamp as updateBootcampQuery,
+  deleteBootcamp as deleteBootcampQuery,
+  createLead as createLeadQuery,
+  updateLead as updateLeadQuery,
+  updateLeadStatus as updateLeadStatusQuery,
+  deleteLead as deleteLeadQuery,
+  createActivity,
+  createContact as createContactQuery,
+  updateContact as updateContactQuery,
+  createOrganization as createOrganizationQuery,
+  updateOrganization as updateOrganizationQuery,
+  getOrCreateOrganizationByName,
+  getLeadById,
+  createDeal as createDealQuery,
+  updateDeal as updateDealQuery,
+  updateDealStatus as updateDealStatusQuery,
+  getDefaultDealStatus,
+  createNote as createNoteQuery,
+  updateNote as updateNoteQuery,
+  createTask as createTaskQuery,
+  updateTask as updateTaskQuery,
+  updateTaskStatus as updateTaskStatusQuery,
+  deleteTask as deleteTaskQuery,
+} from "@/lib/queries";
+
+// ── Bootcamp (Formation) actions ───────────────────────
+
+export async function createBootcampAction(formData: FormData) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  // Sans le droit sur l'argent, la formation naît sans prix catalogue.
+  if (!(await peut("argent", "gerer"))) for (const k of ["priceTotal", "monthlyCount", "monthlyAmount"]) formData.delete(k);
+  const name = String(formData.get("name") || "").trim();
+  if (!name) return;
+
+  const slug = String(formData.get("slug") || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "") || name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+
+  await createBootcampQuery({
+    name,
+    slug,
+    description: String(formData.get("description") || "").trim() || null,
+    startDate: String(formData.get("startDate") || "") || null,
+    endDate: String(formData.get("endDate") || "") || null,
+    status: (String(formData.get("status") || "open") as "draft" | "open" | "in_progress" | "completed" | "cancelled") ?? "open",
+    capacity: Number(formData.get("capacity") || 0) || null,
+    // Offre & paiement (Phase 3a UI)
+    currency: String(formData.get("currency") || "TND").trim() || "TND",
+    priceTotal: String(formData.get("priceTotal") || "").trim() || null,
+    monthlyCount: Number(formData.get("monthlyCount") || 0) || null,
+    monthlyAmount: String(formData.get("monthlyAmount") || "").trim() || null,
+  });
+
+  revalidatePath("/bootcamps");
+}
+
+export async function updateBootcampFieldAction(
+  bootcampId: string,
+  field: string,
+  value: string
+) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  // Le prix catalogue est un montant : il faut aussi le droit sur l'argent.
+  if (["priceTotal", "monthlyCount", "monthlyAmount"].includes(field)) await exiger("argent", "gerer");
+  const allowed = [
+    "name",
+    "slug",
+    "description",
+    "startDate",
+    "endDate",
+    "status",
+    "capacity",
+    "currency",
+    "priceTotal",
+    "monthlyCount",
+    "monthlyAmount",
+  ];
+  if (!allowed.includes(field)) return;
+
+  const data: Record<string, unknown> = { [field]: value || null };
+  // Convertir startDate/endDate en Date
+  if (field === "startDate" || field === "endDate") {
+    data[field] = value ? value : null;
+  }
+  if (field === "capacity") {
+    data[field] = value ? Number(value) : null;
+  }
+  if (field === "monthlyCount") {
+    data[field] = value ? Number(value) : null;
+  }
+  // priceTotal, monthlyAmount, currency : string direct (null si vide)
+
+  await updateBootcampQuery(bootcampId, data as never);
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  revalidatePath("/bootcamps");
+}
+
+export async function deleteBootcampAction(bootcampId: string) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  await deleteBootcampQuery(bootcampId);
+  revalidatePath("/bootcamps");
+}
+
+// ── Form Sources (formulaires Elementor) actions ───────
+
+// ── Désignation kind d'une colonne (Converti / Perdu / Normal) ──
+export async function setStageKindAction(
+  bootcampId: string,
+  statusId: string,
+  kind: string
+) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  if (kind !== "normal" && kind !== "converted" && kind !== "lost") {
+    return { error: "Type de colonne invalide." };
+  }
+  const { setStageKind, getLeadStatuses } = await import("@/lib/queries");
+  await setStageKind(bootcampId, statusId, kind);
+  revalidatePath(`/bootcamps/${bootcampId}`);
+
+  // Garde-fou non bloquant : un bootcamp devrait toujours avoir converted + lost.
+  const statuses = await getLeadStatuses(bootcampId);
+  if (!statuses.some((s) => s.kind === "converted")) {
+    return {
+      ok: true,
+      warning:
+        "Aucune colonne « Converti » : plus aucune inscription possible tant que tu n'en désignes pas une.",
+    };
+  }
+  if (!statuses.some((s) => s.kind === "lost")) {
+    return { ok: true, warning: "Aucune colonne « Perdu » désignée." };
+  }
+  return { ok: true };
+}
+
+// ── Automatisation d'une colonne ───────────────────────
+// « Un lead entre dans cette colonne » → il reçoit un modèle d'email.
+// Une colonne porte AU PLUS une règle : enregistrer écrase la précédente.
+
+export async function saveStageTagAction(
+  bootcampId: string,
+  statusId: string,
+  tagId: string
+) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  if (!tagId) return { error: "Choisis un tag." };
+
+  const { upsertStageTag } = await import("@/lib/queries");
+  const { currentActor } = await import("@/lib/auth");
+  await upsertStageTag(statusId, tagId, await currentActor());
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return { ok: true };
+}
+
+export async function deleteStageTagAction(bootcampId: string, statusId: string) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  const { deleteStageTag } = await import("@/lib/queries");
+  await deleteStageTag(statusId);
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return { ok: true };
+}
+
+export async function saveColumnAutomationAction(
+  bootcampId: string,
+  statusId: string,
+  emailTemplateId: string,
+  delayMinutes: number,
+  active: boolean,
+  /** Canal de la règle. Absent = email, pour ne pas casser les appels existants. */
+  canal: "email" | "whatsapp" = "email",
+  whatsapp?: { template: string; langue: string; variables: string[] },
+  /** « J+n à h h » (heure locale). atHour null = c'est delayMinutes qui compte. */
+  timing?: { delayDays: number; atHour: number | null },
+  /** Règle à modifier ; absent = nouvelle règle (une colonne en porte plusieurs). */
+  automationId?: string
+) {
+  await requireUser();
+  await exiger("formations", "gerer");
+
+  if (!Number.isInteger(delayMinutes) || delayMinutes < 0 || delayMinutes > 43200) {
+    return { error: "Délai invalide (0 à 30 jours)." };
+  }
+  const delayDays = timing?.delayDays ?? 0;
+  const atHour = timing?.atHour ?? null;
+  if (!Number.isInteger(delayDays) || delayDays < 0 || delayDays > 60) {
+    return { error: "Jour invalide (J+0 à J+60)." };
+  }
+  if (atHour !== null && (!Number.isInteger(atHour) || atHour < 0 || atHour > 23)) {
+    return { error: "Heure invalide (0 à 23)." };
+  }
+
+  const { getEmailTemplateById, getAutomationsByBootcamp, createAutomation, updateAutomation } =
+    await import("@/lib/queries");
+
+  // Les valeurs écrites en base dépendent du canal, et on met à NULL celles de
+  // l'autre : une règle basculée d'un canal à l'autre ne doit pas garder un
+  // modèle fantôme que personne ne voit plus.
+  let champs: Record<string, unknown>;
+
+  if (canal === "whatsapp") {
+    const nom = whatsapp?.template?.trim();
+    if (!nom) return { error: "Indique le nom du modèle WhatsApp approuvé par Meta." };
+    // Meta impose ce format aux noms de modèles : minuscules, chiffres,
+    // underscores. Le refuser ici évite un échec au premier envoi réel.
+    if (!/^[a-z0-9_]+$/.test(nom)) {
+      return {
+        error:
+          "Un nom de modèle Meta ne contient que des minuscules, des chiffres et des underscores.",
+      };
+    }
+    champs = {
+      channel: "whatsapp",
+      whatsappTemplate: nom,
+      whatsappLanguage: whatsapp?.langue?.trim() || "fr",
+      whatsappVariables: whatsapp?.variables ?? [],
+      emailTemplateId: null,
+      delayMinutes,
+      delayDays,
+      atHour,
+      active,
+    };
+  } else {
+    if (!emailTemplateId) return { error: "Choisis un modèle d'email." };
+    // Un modèle sans objet est refusé À LA CRÉATION DE LA RÈGLE, pas découvert
+    // au premier envoi — sinon la panne n'apparaît que le jour où ça compte.
+    const template = await getEmailTemplateById(emailTemplateId);
+    if (!template) return { error: "Modèle d'email introuvable." };
+    if (!template.subject?.trim()) {
+      return { error: `Le modèle « ${template.name} » n'a pas d'objet : il ne peut pas être envoyé.` };
+    }
+    champs = {
+      channel: "email",
+      emailTemplateId,
+      whatsappTemplate: null,
+      delayMinutes,
+      delayDays,
+      atHour,
+      active,
+    };
+  }
+
+  // On ne modifie que LA règle désignée, et seulement si elle est bien dans
+  // cette colonne : un identifiant d'ailleurs ne doit pas réécrire une règle
+  // d'une autre formation.
+  const existing = automationId
+    ? (await getAutomationsByBootcamp(bootcampId)).find(
+        (a) => a.id === automationId && a.statusId === statusId
+      )
+    : undefined;
+  if (automationId && !existing) return { error: "Règle introuvable." };
+
+  if (existing) {
+    // Réactiver une règle arrêtée par Meta efface le motif de l'arrêt.
+    await updateAutomation(existing.id, { ...champs, ...(active ? { pausedReason: null } : {}) });
+  } else {
+    const { currentActor } = await import("@/lib/auth");
+    await createAutomation({
+      bootcampId,
+      statusId,
+      ...champs,
+      createdBy: await currentActor(),
+    } as Parameters<typeof createAutomation>[0]);
+  }
+
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return { ok: true };
+}
+
+/**
+ * Relecture IA d'une fiche à son ouverture. Gratuite quand rien n'a changé
+ * (même hash → « inchangé »), au plus une lecture par heure par fiche sinon.
+ * `force` = le bouton « relire maintenant ».
+ */
+export async function refreshLeadInsightAction(leadId: string, force = false) {
+  await requireUser();
+  await exiger("leads", "voir");
+  const { getLeadById, getInsightForLead } = await import("@/lib/queries");
+  const existing = await getInsightForLead(leadId);
+  if (!force && existing && Date.now() - new Date(existing.createdAt).getTime() < 3_600_000) {
+    return { outcome: "récent" as const };
+  }
+  const lead = await getLeadById(leadId);
+  if (!lead) return { outcome: "erreur" as const, error: "Lead introuvable" };
+  const { analyzeLead } = await import("@/lib/ai/lead-insights");
+  const res = await analyzeLead(lead);
+  if (res.outcome === "analysé") revalidatePath(`/leads/${leadId}`);
+  return res;
+}
+
+/**
+ * « Appliquer » la température proposée par la lecture IA. Rien ne change sans
+ * ce clic. La valeur est RELUE en base, pas reçue du navigateur : le bouton ne
+ * peut appliquer que ce que l'IA a réellement proposé. Journalisé avec son
+ * auteur (createActivity pose le compte connecté).
+ */
+export async function applySuggestedTemperatureAction(leadId: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const { db } = await import("@/db");
+  const { leads, leadInsights } = await import("@/db/schema");
+  const { eq } = await import("drizzle-orm");
+  const [row] = await db
+    .select({ proposee: leadInsights.suggestedTemperature, preuve: leadInsights.temperatureProof, actuelle: leads.temperature })
+    .from(leadInsights)
+    .innerJoin(leads, eq(leads.id, leadInsights.leadId))
+    .where(eq(leadInsights.leadId, leadId))
+    .limit(1);
+  if (!row?.proposee) return { error: "Aucune température proposée pour ce lead." };
+  if (row.proposee === row.actuelle) return { ok: true };
+
+  await updateLeadQuery(leadId, { temperature: row.proposee });
+  const libelle = (t: "hot" | "cold") => (t === "hot" ? "🔥 chaud" : "❄️ froid");
+  await createActivity({
+    referenceType: "lead",
+    referenceId: leadId,
+    type: "status_change",
+    direction: "outbound",
+    subject: "Température modifiée",
+    content: `${libelle(row.actuelle)} → ${libelle(row.proposee)} (proposée par la lecture IA${row.preuve ? ` : ${row.preuve}` : ""})`,
+  });
+
+  revalidatePath(`/leads/${leadId}`);
+  revalidatePath("/leads");
+  return { ok: true };
+}
+
+export async function deleteColumnAutomationAction(bootcampId: string, automationId: string) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  const { deleteAutomation } = await import("@/lib/queries");
+  await deleteAutomation(automationId);
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return { ok: true };
+}
+
+/** Journal d'une règle, chargé à l'ouverture du panneau. */
+export async function getColumnAutomationRunsAction(automationId: string) {
+  await requireUser();
+  await exiger("formations", "voir");
+  const { getAutomationRuns } = await import("@/lib/queries");
+  return getAutomationRuns(automationId);
+}
+
+export async function getColumnAutomationStatsAction(automationId: string) {
+  await requireUser();
+  await exiger("formations", "voir");
+  const { getAutomationStats } = await import("@/lib/queries");
+  return getAutomationStats(automationId);
+}
+
+// ── Colonnes (stages) : créer / renommer / supprimer ───
+
+export async function createStageAction(bootcampId: string, name: string) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  if (!bootcampId) return { error: "Formation requise." };
+  const { createStage } = await import("@/lib/queries");
+  await createStage(bootcampId, name.trim() || "Nouvelle colonne");
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return { ok: true };
+}
+
+export async function renameStageAction(
+  bootcampId: string,
+  statusId: string,
+  name: string
+) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  const clean = name.trim();
+  if (!clean) return { error: "Le nom est requis." };
+  const { renameStage } = await import("@/lib/queries");
+  await renameStage(statusId, clean); // whitelist : name uniquement
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return { ok: true };
+}
+
+export async function deleteStageAction(bootcampId: string, statusId: string) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  const { getLeadStatusById, countLeadsByStatus, deleteStage } = await import(
+    "@/lib/queries"
+  );
+  const stage = await getLeadStatusById(statusId);
+  if (!stage) return { error: "Colonne introuvable." };
+  // États terminaux jamais supprimables (préserve 1 converted + 1 lost).
+  if (stage.kind === "converted" || stage.kind === "lost") {
+    return { error: "Colonne terminale (Converti/Perdu) : non supprimable." };
+  }
+  // Bloqué si la colonne contient des leads (option A : pas de déplacement auto).
+  const count = await countLeadsByStatus(statusId);
+  if (count > 0) {
+    return {
+      error: `Déplace d'abord les ${count} lead${count > 1 ? "s" : ""} de cette colonne.`,
+    };
+  }
+  await deleteStage(statusId);
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return { ok: true };
+}
+
+// Réordonne les colonnes selon l'ordre d'ids fourni (positions 0..n).
+export async function reorderStagesAction(
+  bootcampId: string,
+  orderedIds: string[]
+) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  if (!Array.isArray(orderedIds) || orderedIds.length === 0) {
+    return { error: "Ordre invalide." };
+  }
+  const { reorderStages } = await import("@/lib/queries");
+  await reorderStages(bootcampId, orderedIds);
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return { ok: true };
+}
+
+// ── Lead actions ───────────────────────────────────────
+
+export async function createLeadAction(formData: FormData) {
+  await requireUser();
+  await exiger("leads", "gerer");
+
+  // Formation OBLIGATOIRE : leads.bootcamp_id est NOT NULL — un lead appartient toujours
+  // à une formation. Sans elle, on n'insère pas (sinon erreur PG 23502).
+  const bootcampId = String(formData.get("bootcampId") || "").trim();
+  if (!bootcampId) {
+    return { error: "Choisis une formation." };
+  }
+
+  // Identité : prénom + nom → fullName (NOT NULL en base).
+  const firstName = String(formData.get("firstName") || "").trim() || null;
+  const lastName = String(formData.get("lastName") || "").trim() || null;
+  const fullName = [firstName, lastName].filter(Boolean).join(" ").trim();
+  if (!fullName) {
+    return { error: "Le prénom est requis." };
+  }
+
+  const email = String(formData.get("email") || "").trim() || null;
+  const mobileNo = String(formData.get("mobileNo") || "").trim() || null;
+  // Infos de LA PERSONNE → portées par le contact.
+  const whatsapp = String(formData.get("whatsapp") || "").trim() || null;
+  const ageRaw = String(formData.get("age") || "").trim();
+  const age = ageRaw ? Number.parseInt(ageRaw, 10) : null;
+  // Infos de L'INSCRIPTION → portées par le lead.
+  const promoCode = String(formData.get("promoCode") || "").trim() || null;
+  const intendedPlanRaw = String(formData.get("intendedPlan") || "");
+  const intendedPlan =
+    intendedPlanRaw === "total" || intendedPlanRaw === "monthly"
+      ? intendedPlanRaw
+      : null;
+
+  // Statut : 1ère colonne (plus basse position) du pipeline du bootcamp si non fourni.
+  const { getOrCreateContactForLead, getLeadStatuses } = await import("@/lib/queries");
+  let statusId = String(formData.get("statusId") || "").trim() || null;
+  if (!statusId) {
+    const statuses = await getLeadStatuses(bootcampId); // triés par position asc
+    statusId = statuses[0]?.id ?? null;
+  }
+
+  // Dédup contact : on rattache la personne dès la création manuelle (Phase 2).
+  const contact = await getOrCreateContactForLead({
+    email,
+    mobileNo,
+    firstName,
+    lastName,
+    fullName,
+    whatsapp,
+    age: age !== null && !Number.isNaN(age) ? age : null,
+  });
+
+  await createLeadQuery({
+    fullName,
+    firstName,
+    lastName,
+    email,
+    mobileNo,
+    intendedPlan,
+    promoCode,
+    promoCodeId: await (await import("@/lib/promo")).idDuCode(promoCode),
+    sourceId: String(formData.get("sourceId") || "") || null,
+    bootcampId,
+    statusId,
+    stageEnteredAt: new Date(),
+    contactId: contact.id,
+  });
+
+  revalidatePath("/leads");
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return { ok: true };
+}
+
+export async function updateLeadFieldAction(
+  leadId: string,
+  field: string,
+  value: string
+) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const allowed = [
+    "fullName",
+    "firstName",
+    "lastName",
+    "email",
+    "mobileNo",
+    "phone",
+    "intendedPlan",
+    "promoCode",
+  ];
+  if (!allowed.includes(field)) return;
+
+  await updateLeadQuery(leadId, {
+    [field]: value || null,
+    // Le code tapé change : le code reconnu suit.
+    ...(field === "promoCode" ? { promoCodeId: await (await import("@/lib/promo")).idDuCode(value) } : {}),
+  });
+
+  // L'email doit suivre sur le CONTACT : c'est lui qui sert aux campagnes.
+  // Sans ça, corriger une adresse ici ne change rien à qui reçoit quoi.
+  if (field === "email") {
+    const { syncLeadEmailToContact } = await import("@/lib/queries");
+    await syncLeadEmailToContact(leadId, value || null);
+  }
+
+  revalidatePath(`/leads/${leadId}`);
+}
+
+// Édite un champ porté par le CONTACT lié (whatsapp, âge) depuis la fiche lead,
+// et revalide la page du lead pour refléter le changement.
+export async function updateLeadContactFieldAction(
+  leadId: string,
+  contactId: string,
+  field: string,
+  value: string
+) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const allowed = ["whatsapp", "age"];
+  if (!allowed.includes(field)) return;
+
+  if (field === "age") {
+    const n = value.trim() ? Number.parseInt(value, 10) : null;
+    if (n !== null && Number.isNaN(n)) return;
+    await updateContactQuery(contactId, { age: n });
+  } else {
+    await updateContactQuery(contactId, { whatsapp: value.trim() || null });
+  }
+  revalidatePath(`/leads/${leadId}`);
+}
+
+/**
+ * Consentement WhatsApp donné de vive voix (pendant l'appel). Meta accepte
+ * l'opt-in oral s'il est tracé : la date, et QUI l'a recueilli. Une trace dans
+ * le fil aussi, pour que ça se lise sans ouvrir la base.
+ */
+export async function grantWhatsAppConsentByPhoneAction(leadId: string, contactId: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const { currentActor } = await import("@/lib/auth");
+  const auteur = (await currentActor()) ?? "équipe";
+  const now = new Date();
+  await updateContactQuery(contactId, {
+    whatsappConsentAt: now,
+    whatsappConsentSource: `Téléphone — ${auteur}`,
+    whatsappConsentText: `A accepté de vive voix de recevoir les messages WhatsApp de ${(await (await import("@/lib/organisation")).getOrganisation()).nom || "l'école"}`,
+    whatsappUnsubscribedAt: null,
+  });
+  await createActivity({
+    referenceType: "lead",
+    referenceId: leadId,
+    type: "note",
+    subject: "Consentement WhatsApp donné par téléphone",
+    content: `Recueilli par ${auteur} le ${now.toLocaleDateString("fr-FR")}.`,
+    createdBy: auteur,
+  });
+  revalidatePath(`/leads/${leadId}`);
+  return { ok: true as const };
+}
+
+export async function updateLeadStatusAction(
+  leadId: string,
+  statusId: string
+) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  // Capture l'ancien statut AVANT l'update (pour stage_history) — Phase 1, ajout pur.
+  const { getLeadStatusId, recordStageChange, getStatusLabels } = await import(
+    "@/lib/queries"
+  );
+  const oldStatusId = await getLeadStatusId(leadId);
+
+  const lead = await updateLeadStatusQuery(leadId, statusId);
+
+  // Le journal nomme les colonnes. Il écrivait leur identifiant interne :
+  // « Nouveau statut: 6d674394-963f-… », illisible sur la fiche.
+  const newStatusId = lead?.statusId ?? statusId;
+  const labels = await getStatusLabels([oldStatusId, newStatusId].filter(
+    (v): v is string => !!v
+  ));
+  const from = oldStatusId ? labels.get(oldStatusId) : null;
+  const to = labels.get(newStatusId) ?? newStatusId;
+
+  await createActivity({
+    referenceType: "lead",
+    referenceId: leadId,
+    type: "status_change",
+    direction: "outbound",
+    subject: "Statut modifié",
+    content: from ? `${from} → ${to}` : `Déplacé dans « ${to} »`,
+  });
+
+  // Capture structurée de la transition (Phase 1) — à côté du createActivity existant.
+  await recordStageChange(leadId, oldStatusId, lead?.statusId ?? statusId);
+
+  // Automatisation « entrée dans la colonne ». ATTENDU, jamais en tâche de
+  // fond : en serverless une promesse non attendue est tuée au retour.
+  const { runStatusAutomations } = await import("@/lib/automations");
+  await runStatusAutomations(leadId, lead?.statusId ?? statusId);
+
+  const { createNotification } = await import("@/lib/queries");
+  await createNotification({
+    type: "lead_status_change",
+    message: `Statut du lead modifié`,
+    referenceType: "lead",
+    referenceId: leadId,
+    read: false,
+  });
+
+  revalidatePath("/leads");
+  revalidatePath(`/leads/${leadId}`);
+}
+
+/**
+ * Supprime un lead, définitivement.
+ *
+ * ⚠️ Six tables pointent le lead par référence POLYMORPHE (`reference_type`
+ * + `reference_id`) : activities, call_logs, comments, notes, notifications,
+ * tasks. Aucune n'a de clé étrangère, donc **aucune ne casse et aucune ne se
+ * nettoie toute seule** — sans ce ménage explicite, l'historique du lead reste
+ * en base pour toujours, invisible, rattaché à un identifiant mort.
+ *
+ * Deux liens à clé étrangère sont en NO ACTION et feraient échouer le DELETE
+ * sur une erreur Postgres brute : un deal, et un report vers une autre session.
+ * On les nomme au lieu de laisser passer le message technique.
+ */
+export async function deleteLeadAction(leadId: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const { getLeadDeleteBlockers } = await import("@/lib/queries");
+
+  const blockers = await getLeadDeleteBlockers(leadId);
+  if (blockers.length > 0) {
+    return { ok: false as const, message: blockers.join(" ") };
+  }
+
+  await deleteLeadQuery(leadId);
+  revalidatePath("/leads");
+  revalidatePath("/bootcamps");
+  return { ok: true as const, message: "Lead supprimé." };
+}
+
+// ── Actions groupées sur les leads ─────────────────────
+// Toutes réutilisent la logique unitaire, une ligne à la fois. Volontairement :
+// une version « en masse » écrite à part finirait par diverger de la version
+// unitaire (historique de colonne, activité, notification) sans que rien ne
+// le signale.
+
+/** Plafond commun : au-delà, la fonction serverless dépasserait son temps. */
+const BULK_MAX = 200;
+
+export async function bulkDeleteLeadsAction(leadIds: string[]) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const ids = leadIds.slice(0, BULK_MAX);
+  if (ids.length === 0) return { ok: false as const, message: "Aucun lead sélectionné." };
+
+  const { getLeadDeleteBlockers, getLeadById } = await import("@/lib/queries");
+
+  let deleted = 0;
+  const refused: string[] = [];
+  for (const id of ids) {
+    const blockers = await getLeadDeleteBlockers(id);
+    if (blockers.length > 0) {
+      const lead = await getLeadById(id);
+      refused.push(lead?.fullName ?? id);
+      continue;
+    }
+    await deleteLeadQuery(id);
+    deleted++;
+  }
+
+  revalidatePath("/leads");
+  revalidatePath("/bootcamps");
+
+  if (refused.length > 0) {
+    return {
+      ok: true as const,
+      message:
+        `${deleted} lead(s) supprimé(s). ${refused.length} refusé(s) — rattaché(s) à un deal ` +
+        `ou déjà reporté(s) : ${refused.join(", ")}.`,
+    };
+  }
+  return { ok: true as const, message: `${deleted} lead(s) supprimé(s).` };
+}
+
+export async function bulkSetLeadStatusAction(leadIds: string[], statusId: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const ids = leadIds.slice(0, BULK_MAX);
+  if (ids.length === 0) return { ok: false as const, message: "Aucun lead sélectionné." };
+
+  const { getLeadStatusById } = await import("@/lib/queries");
+  const target = await getLeadStatusById(statusId);
+  if (!target) return { ok: false as const, message: "Colonne introuvable." };
+  // L'inscription demande l'offre ET le montant réellement convenu : elle ne
+  // peut pas se faire en masse. Voir enrollLeadAction.
+  if (target.kind === "converted") {
+    return {
+      ok: false as const,
+      message: "« Inscrit » se fait un par un : la fenêtre demande l'offre et le montant.",
+    };
+  }
+
+  for (const id of ids) await updateLeadStatusAction(id, statusId);
+
+  revalidatePath("/leads");
+  return { ok: true as const, message: `${ids.length} lead(s) déplacé(s) vers « ${target.name} ».` };
+}
+
+export async function bulkToggleLeadTagAction(
+  leadIds: string[],
+  tagId: string,
+  on: boolean
+) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const ids = leadIds.slice(0, BULK_MAX);
+  if (ids.length === 0) return { ok: false as const, message: "Aucun lead sélectionné." };
+
+  const { attachTagToLead, detachTagFromLead, getTagById } = await import("@/lib/queries");
+  const tag = await getTagById(tagId);
+  if (!tag) return { ok: false as const, message: "Tag introuvable." };
+
+  for (const id of ids) {
+    if (on) await attachTagToLead(id, tagId);
+    else await detachTagFromLead(id, tagId);
+  }
+
+  revalidatePath("/leads");
+  return {
+    ok: true as const,
+    message: `Tag « ${tag.name} » ${on ? "posé sur" : "retiré de"} ${ids.length} lead(s).`,
+  };
+}
+
+export async function addLeadNoteAction(leadId: string, content: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  if (!content.trim()) return;
+
+  await createActivity({
+    referenceType: "lead",
+    referenceId: leadId,
+    type: "note",
+    direction: "outbound",
+    subject: "Note",
+    content: content.trim(),
+  });
+
+  revalidatePath(`/leads/${leadId}`);
+}
+
+export async function convertToDealAction(leadId: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const lead = await getLeadById(leadId);
+  if (!lead) return;
+
+  // Auto-create organization from lead's organizationName (if provided)
+  let organizationId: string | null = null;
+  if (lead.organizationName) {
+    const org = await getOrCreateOrganizationByName(lead.organizationName);
+    organizationId = org.id;
+    if (lead.industryId) {
+      await updateOrganizationQuery(org.id, { industryId: lead.industryId });
+    }
+  }
+
+  // Auto-create contact from lead
+  const contact = await createContactQuery({
+    firstName: lead.firstName,
+    lastName: lead.lastName,
+    fullName: lead.fullName,
+    email: lead.email,
+    mobileNo: lead.mobileNo,
+    phone: lead.phone,
+    organizationId,
+  });
+
+  // Mark lead as converted + link to org
+  await updateLeadQuery(leadId, {
+    converted: true,
+    organizationId,
+  });
+
+  // Create the Deal linked to lead + org
+  const defaultStatus = await getDefaultDealStatus();
+  const deal = await createDealQuery({
+    leadId,
+    organizationId,
+    statusId: defaultStatus?.id ?? null,
+    firstName: lead.firstName,
+    lastName: lead.lastName,
+    email: lead.email,
+    mobileNo: lead.mobileNo,
+    phone: lead.phone,
+    website: lead.website,
+    sourceId: lead.sourceId,
+    industryId: lead.industryId,
+  });
+
+  await createActivity({
+    referenceType: "lead",
+    referenceId: leadId,
+    type: "status_change",
+    direction: "outbound",
+    subject: "Converti en Deal",
+    content: `Contact ${contact.fullName} créé + Deal créé${organizationId ? " + organization liée" : ""}`,
+  });
+
+  // Capture structurée (Phase 1) : enregistre le stage du lead au moment de la conversion.
+  // toStatusId = null car la conversion actuelle (B2B) ne déplace pas le lead vers un stage
+  // "Converti" formation — ce flux sera réécrit en Phase 2/3.
+  const { recordStageChange } = await import("@/lib/queries");
+  await recordStageChange(leadId, lead.status?.id ?? null, null);
+
+  revalidatePath(`/leads/${leadId}`);
+  revalidatePath("/leads");
+  revalidatePath("/deals");
+  revalidatePath(`/deals/${deal.id}`);
+  revalidatePath("/contacts");
+  revalidatePath("/organizations");
+}
+
+// ── Inscription à une formation (Phase 3a) ─────────────
+// La VRAIE conversion du CRM formation-centric : inscrire un lead à sa formation,
+// avec plan de paiement. Ne crée NI deal NI organisation (contrairement à
+// convertToDealAction qui reste intacte pour le sous-système B2B legacy).
+export async function enrollLeadAction(
+  leadId: string,
+  input: {
+    plan: "total" | "monthly";
+    firstPaymentReceived: boolean;
+    // Qui a encaissé ce premier versement — email d'un membre ou 'banque'.
+    receivedBy?: string;
+    // Comment il est arrivé — 'especes' | 'virement' | 'cheque'.
+    method?: string;
+    // Montants NÉGOCIÉS. Absents → tarif de la formation.
+    totalAmount?: string;
+    monthlyCount?: number;
+    // Un montant par échéance (500 / 400 / 400) : toutes ne se valent pas.
+    monthlyAmounts?: string[];
+  }
+) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  await exiger("argent", "gerer");
+
+  // Un montant saisi à la main doit être un nombre strictement positif : un zéro
+  // ou une virgule égarée produirait un échéancier faux, découvert au moment de
+  // réclamer l'argent.
+  const money = (raw?: string) => {
+    if (raw === undefined || raw === "") return undefined;
+    const n = Number(String(raw).replace(",", "."));
+    return Number.isFinite(n) && n > 0 ? n.toFixed(2) : null;
+  };
+  const totalAmount = money(input.totalAmount);
+  if (totalAmount === null) {
+    return { error: "Montant invalide (nombre strictement positif attendu)." };
+  }
+  let monthlyCount: number | undefined;
+  if (input.monthlyCount !== undefined) {
+    const c = Math.trunc(input.monthlyCount);
+    if (!Number.isFinite(c) || c < 1 || c > 24) {
+      return { error: "Nombre de mensualités invalide (entre 1 et 24)." };
+    }
+    monthlyCount = c;
+  }
+  let monthlyAmounts: string[] | undefined;
+  if (input.monthlyAmounts !== undefined) {
+    if (monthlyCount !== undefined && input.monthlyAmounts.length !== monthlyCount) {
+      return { error: "Il manque le montant d'une ou plusieurs échéances." };
+    }
+    const parsed = input.monthlyAmounts.map((a) => money(a));
+    const bad = parsed.findIndex((a) => a === null || a === undefined);
+    if (bad !== -1) {
+      return { error: `Montant de l'échéance ${bad + 1} invalide (nombre strictement positif attendu).` };
+    }
+    monthlyAmounts = parsed as string[];
+  }
+
+  const {
+    getLeadById,
+    getConvertedStageForBootcamp,
+    paymentStatus,
+  } = await import("@/lib/queries");
+
+  // 2. Charge le lead + son bootcamp
+  const lead = await getLeadById(leadId);
+  if (!lead) return { error: "Lead introuvable" };
+  const bootcamp = lead.bootcamp;
+  if (!bootcamp) return { error: "Lead non rattaché à une formation" };
+
+  // 3. Garde-fous
+  if (lead.converted) return { error: "déjà inscrit" };
+  if (lead.status?.kind === "converted") return { error: "déjà inscrit" };
+
+  if (input.plan === "total" && !bootcamp.priceTotal) {
+    return { error: "offre Total non configurée sur la formation" };
+  }
+  if (input.plan === "monthly" && (!bootcamp.monthlyCount || !bootcamp.monthlyAmount)) {
+    return { error: "offre Mensuelle non configurée" };
+  }
+
+  // 4. Stage kind='converted' du bootcamp
+  const convertedStage = await getConvertedStageForBootcamp(bootcamp.id);
+  if (!convertedStage) {
+    return { error: "cette formation n'a pas de colonne Converti" };
+  }
+
+  // 5-8. Transaction atomique : les écritures réussissent ensemble ou aucune.
+  // Les helpers DAL sont transaction-aware (exec = tx) — une seule source de vérité
+  // pour le calcul des dueDate (generateScheduleForLead) et l'insertion stage_history
+  // (moveLeadToStage). Aucune logique dupliquée ici.
+  const { db } = await import("@/db");
+  const {
+    moveLeadToStage,
+    generateScheduleForLead,
+    markFirstEcheancePaid,
+  } = await import("@/lib/queries");
+  const { leads: leadsTable } = await import("@/db/schema");
+  const { eq: eqOp } = await import("drizzle-orm");
+
+  // Remonte hors de la transaction : le dialogue d'inscription s'en sert pour
+  // attacher le justificatif à la bonne échéance juste après.
+  let firstEcheanceId: string | null = null;
+
+  await db.transaction(async (tx) => {
+    // 5. Déplace le lead vers le stage converted (insère stage_history en interne)
+    await moveLeadToStage(leadId, convertedStage.id, tx);
+
+    // 6. Marque le lead converti
+    await tx
+      .update(leadsTable)
+      .set({ converted: true, convertedAt: new Date(), updatedAt: new Date() })
+      .where(eqOp(leadsTable.id, leadId));
+
+    // 7. Génère l'échéancier (logique dueDate centralisée dans le helper)
+    await generateScheduleForLead(leadId, input.plan, tx, {
+      totalAmount,
+      monthlyCount,
+      monthlyAmounts,
+    });
+
+    // 8. 1er paiement encaissé → marque la première échéance
+    if (input.firstPaymentReceived) {
+      firstEcheanceId = await markFirstEcheancePaid(
+        leadId,
+        tx,
+        input.receivedBy ?? null,
+        input.method ?? null
+      );
+    }
+  });
+
+  // 8.4 La bonne nouvelle pour toute l'équipe : la cloche la fait sonner.
+  {
+    const { createNotification } = await import("@/lib/queries");
+    await createNotification({
+      type: "lead_enrolled",
+      message: `${lead.fullName ?? "Un lead"} inscrit — ${bootcamp.name}`,
+      referenceType: "lead",
+      referenceId: leadId,
+      read: false,
+    });
+  }
+
+  // 8.5 Automatisation de la colonne d'arrivée. APRÈS la transaction : avant,
+  // le nouveau statut n'est pas encore visible depuis une autre connexion.
+  {
+    const { getLeadStatusId } = await import("@/lib/queries");
+    const { runStatusAutomations } = await import("@/lib/automations");
+    const nowStatusId = await getLeadStatusId(leadId);
+    await runStatusAutomations(leadId, nowStatusId);
+  }
+
+  // 9. revalidate
+  revalidatePath("/leads");
+  revalidatePath(`/leads/${leadId}`);
+  revalidatePath(`/bootcamps/${bootcamp.id}`);
+
+  // 10. Retourne le statut paiement dérivé
+  const status = await paymentStatus(leadId);
+  return { ok: true, paymentStatus: status, firstEcheanceId };
+}
+
+// ── Payment schedule actions (Phase 3b) ────────────────
+
+/**
+ * Changer l'offre d'un lead DÉJÀ inscrit.
+ *
+ * Le champ « Offre envisagée » de la fiche ne sert plus une fois inscrit :
+ * c'est l'échéancier qui porte l'argent. Constaté le 2026-09-09 — un lead avait
+ * `intended_plan = null` et un échéancier « total » de 1000 : les deux avaient
+ * divergé sans que rien ne le signale.
+ */
+/**
+ * L'offre négociée avec un lead — sur N'IMPORTE QUEL lead, à tout moment.
+ *
+ * On négocie avant l'inscription, pas seulement pendant. Jusqu'au 2026-09-09 les
+ * montants ne se saisissaient qu'à l'inscription : avant, on ne pouvait choisir
+ * que le TYPE de plan, jamais les montants. Une remise accordée trois semaines
+ * plus tôt n'avait aucun endroit où vivre.
+ *
+ * Si le lead est déjà inscrit, l'échéancier est refait dans la foulée — sinon
+ * l'offre affichée et l'argent réellement dû divergeraient, ce qui est
+ * exactement le problème qu'on répare.
+ */
+export async function setLeadOfferAction(
+  leadId: string,
+  plan: "total" | "monthly",
+  totalAmount: number,
+  monthlyCount: number,
+  monthlyAmount: number
+) {
+  await requireUser();
+  await exiger("argent", "gerer");
+
+  if (plan === "total") {
+    if (!Number.isFinite(totalAmount) || totalAmount <= 0) {
+      return { error: "Saisis un montant total supérieur à zéro." };
+    }
+  } else {
+    if (!Number.isInteger(monthlyCount) || monthlyCount < 1 || monthlyCount > 24) {
+      return { error: "Le nombre d'échéances doit être compris entre 1 et 24." };
+    }
+    if (!Number.isFinite(monthlyAmount) || monthlyAmount <= 0) {
+      return { error: "Saisis un montant par échéance supérieur à zéro." };
+    }
+  }
+
+  const total = plan === "total" ? totalAmount : monthlyCount * monthlyAmount;
+
+  const { updateLead, getScheduleForLead, rescheduleLead } = await import("@/lib/queries");
+
+  await updateLead(leadId, {
+    intendedPlan: plan,
+    offerTotal: plan === "total" ? String(totalAmount) : String(total),
+    offerMonthlyCount: plan === "monthly" ? monthlyCount : null,
+    offerMonthlyAmount: plan === "monthly" ? String(monthlyAmount) : null,
+  });
+
+  // Déjà inscrit : l'argent vit dans l'échéancier, il doit suivre.
+  const schedule = await getScheduleForLead(leadId);
+  if (schedule && schedule.items.length > 0) {
+    const res = await rescheduleLead(leadId, plan, total, plan === "monthly" ? monthlyCount : 1);
+    if (!res.ok) return { error: res.error };
+  }
+
+  const { createActivity } = await import("@/lib/queries");
+  const { currentActor } = await import("@/lib/auth");
+  await createActivity({
+    referenceType: "lead",
+    referenceId: leadId,
+    type: "note",
+    subject: "Offre modifiée",
+    content:
+      plan === "total"
+        ? `Comptant — ${totalAmount}`
+        : `Facilité — ${monthlyCount} × ${monthlyAmount} = ${total}`,
+    createdBy: await currentActor(),
+  });
+
+  revalidatePath(`/leads/${leadId}`);
+  return { ok: true };
+}
+
+/**
+ * Pointer une échéance comme encaissée : qui a reçu l'argent, et la preuve.
+ *
+ * L'ordre compte. L'échéance est marquée payée AVANT la tentative d'envoi du
+ * fichier : un stockage indisponible ne doit jamais empêcher d'enregistrer un
+ * encaissement. Le justificatif manquant se voit sur la fiche et se rattrape ;
+ * un paiement qu'on n'a pas pu pointer se perd.
+ */
+export async function markEcheancePaidAction(formData: FormData) {
+  await requireUser();
+  await exiger("argent", "gerer");
+  const { markEcheancePaid, getScheduleForLead } = await import("@/lib/queries");
+  const { paymentSchedules } = await import("@/db/schema");
+  const { eq } = await import("drizzle-orm");
+  const { db } = await import("@/db");
+
+  const echeanceId = String(formData.get("echeanceId") || "");
+  const receivedByRaw = String(formData.get("receivedBy") || "").trim();
+  const receivedBy = receivedByRaw || null;
+  const methodRaw = String(formData.get("method") || "").trim();
+  const method = ["especes", "virement", "cheque"].includes(methodRaw) ? methodRaw : null;
+
+  const [ech] = await db
+    .select({ leadId: paymentSchedules.leadId })
+    .from(paymentSchedules)
+    .where(eq(paymentSchedules.id, echeanceId))
+    .limit(1);
+  if (!ech) return { error: "Échéance introuvable" };
+
+  await markEcheancePaid(echeanceId, db, receivedBy, method);
+
+  let warning: string | undefined;
+  const file = formData.get("proof");
+  if (file instanceof File && file.size > 0) {
+    const { uploadPaymentProof } = await import("@/lib/payment-proof");
+    const up = await uploadPaymentProof(ech.leadId, echeanceId, file);
+    if (up.ok) {
+      await db
+        .update(paymentSchedules)
+        .set({ proofPath: up.path, proofName: up.name, proofUploadedAt: new Date() })
+        .where(eq(paymentSchedules.id, echeanceId));
+    } else {
+      warning = `Paiement enregistré, mais le justificatif n'est pas parti : ${up.message}`;
+    }
+  }
+
+  const schedule = await getScheduleForLead(ech.leadId);
+  revalidatePath(`/leads/${ech.leadId}`);
+  return { ok: true, status: schedule.summary.status, warning };
+}
+
+/**
+ * Ajouter ou remplacer le justificatif d'une échéance déjà pointée.
+ * Sert à rattraper les « sans justificatif », et à l'inscription une fois la
+ * première échéance créée.
+ */
+export async function attachPaymentProofAction(formData: FormData) {
+  await requireUser();
+  await exiger("argent", "gerer");
+  const { paymentSchedules } = await import("@/db/schema");
+  const { eq } = await import("drizzle-orm");
+  const { db } = await import("@/db");
+  const { uploadPaymentProof } = await import("@/lib/payment-proof");
+
+  const echeanceId = String(formData.get("echeanceId") || "");
+  const file = formData.get("proof");
+  if (!(file instanceof File) || file.size === 0) return { error: "Aucun fichier." };
+
+  const [ech] = await db
+    .select({ leadId: paymentSchedules.leadId })
+    .from(paymentSchedules)
+    .where(eq(paymentSchedules.id, echeanceId))
+    .limit(1);
+  if (!ech) return { error: "Échéance introuvable" };
+
+  const up = await uploadPaymentProof(ech.leadId, echeanceId, file);
+  if (!up.ok) return { error: up.message };
+
+  await db
+    .update(paymentSchedules)
+    .set({ proofPath: up.path, proofName: up.name, proofUploadedAt: new Date() })
+    .where(eq(paymentSchedules.id, echeanceId));
+
+  revalidatePath(`/leads/${ech.leadId}`);
+  return { ok: true };
+}
+
+/**
+ * Le lien de lecture d'un justificatif. Fabriqué à la demande et périmé en
+ * quelques minutes : l'adresse ne doit jamais vivre dans le HTML de la page,
+ * où elle resterait valable après le départ de son lecteur.
+ */
+export async function getProofUrlAction(echeanceId: string) {
+  await requireUser();
+  await exiger("argent", "voir");
+  const { paymentSchedules } = await import("@/db/schema");
+  const { eq } = await import("drizzle-orm");
+  const { db } = await import("@/db");
+  const { signedProofUrl } = await import("@/lib/payment-proof");
+
+  const [ech] = await db
+    .select({ proofPath: paymentSchedules.proofPath })
+    .from(paymentSchedules)
+    .where(eq(paymentSchedules.id, echeanceId))
+    .limit(1);
+  if (!ech?.proofPath) return { error: "Aucun justificatif." };
+
+  const url = await signedProofUrl(ech.proofPath);
+  if (!url) return { error: "Justificatif introuvable dans le stockage." };
+  return { ok: true, url };
+}
+
+/**
+ * Corriger le montant d'une échéance, même déjà encaissée.
+ *
+ * Il y a deux vraies raisons : une erreur de saisie (1 300 au lieu de 975) et
+ * un remboursement partiel. « Modifier l'offre » ne sait pas le faire — il ne
+ * redistribue que le reste à devoir et REFUSE un total inférieur à ce qui est
+ * déjà payé. L'ancien montant part dans le fil d'activité : sur de l'argent,
+ * savoir qui a changé quoi vaut plus que la correction elle-même.
+ */
+export async function updateEcheanceAmountAction(echeanceId: string, amount: number) {
+  await requireUser();
+  await exiger("argent", "gerer");
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return { error: "Le montant doit être supérieur à zéro." };
+  }
+  const { db } = await import("@/db");
+  const { paymentSchedules } = await import("@/db/schema");
+  const { eq } = await import("drizzle-orm");
+
+  const ligne = await db.query.paymentSchedules.findFirst({ where: eq(paymentSchedules.id, echeanceId) });
+  if (!ligne) return { error: "Échéance introuvable." };
+  const ancien = Number(ligne.amount ?? 0);
+  if (ancien === amount) return { ok: true as const };
+
+  await db
+    .update(paymentSchedules)
+    .set({ amount: String(amount) })
+    .where(eq(paymentSchedules.id, echeanceId));
+
+  const { createActivity } = await import("@/lib/queries");
+  const { currentActor } = await import("@/lib/auth");
+  await createActivity({
+    referenceType: "lead",
+    referenceId: ligne.leadId,
+    type: "note",
+    subject: "Montant d'une échéance corrigé",
+    content:
+      `${ancien.toLocaleString("fr-FR")} → ${amount.toLocaleString("fr-FR")}` +
+      (ligne.isPaid ? " (échéance déjà encaissée)" : "") +
+      (ligne.dueDate ? ` · échéance du ${ligne.dueDate}` : ""),
+    createdBy: await currentActor(),
+  });
+
+  revalidatePath(`/leads/${ligne.leadId}`);
+  return { ok: true as const };
+}
+
+export async function markEcheanceUnpaidAction(echeanceId: string) {
+  await requireUser();
+  await exiger("argent", "gerer");
+  const { markEcheanceUnpaid, getScheduleForLead } = await import("@/lib/queries");
+  const { paymentSchedules } = await import("@/db/schema");
+  const { eq } = await import("drizzle-orm");
+  const { db } = await import("@/db");
+
+  const [ech] = await db.select({ leadId: paymentSchedules.leadId }).from(paymentSchedules).where(eq(paymentSchedules.id, echeanceId)).limit(1);
+  if (!ech) return { error: "Échéance introuvable" };
+
+  await markEcheanceUnpaid(echeanceId);
+  const schedule = await getScheduleForLead(ech.leadId);
+  revalidatePath(`/leads/${ech.leadId}`);
+  return { ok: true, status: schedule.summary.status };
+}
+
+// ── Contact actions ────────────────────────────────────
+
+export async function createContactAction(formData: FormData) {
+  await requireUser();
+  await exiger("contacts", "gerer");
+  const fullName = String(formData.get("fullName") || "").trim();
+  if (!fullName) return;
+
+  const organizationId = String(formData.get("organizationId") || "") || null;
+
+  await createContactQuery({
+    fullName,
+    firstName: String(formData.get("firstName") || "").trim() || null,
+    lastName: String(formData.get("lastName") || "").trim() || null,
+    email: String(formData.get("email") || "").trim() || null,
+    mobileNo: String(formData.get("mobileNo") || "").trim() || null,
+    phone: String(formData.get("phone") || "").trim() || null,
+    organizationId: organizationId || null,
+  });
+
+  revalidatePath("/contacts");
+}
+
+// ── Organization actions ───────────────────────────────
+
+export async function createOrganizationAction(formData: FormData) {
+  await requireUser();
+  await exiger("contacts", "gerer");
+  const name = String(formData.get("name") || "").trim();
+  if (!name) return;
+
+  await createOrganizationQuery({
+    name,
+    website: String(formData.get("website") || "").trim() || null,
+    industryId: String(formData.get("industryId") || "") || null,
+    territoryId: String(formData.get("territoryId") || "") || null,
+    annualRevenue: String(formData.get("annualRevenue") || "").trim() || null,
+    noOfEmployees: (String(formData.get("noOfEmployees") || "") || null) as
+      | "1-10"
+      | "11-50"
+      | "51-200"
+      | "201-500"
+      | "501-1000"
+      | "1000+"
+      | null,
+  });
+
+  revalidatePath("/organizations");
+}
+
+// ── Deal actions ───────────────────────────────────────
+
+export async function updateDealFieldAction(
+  dealId: string,
+  field: string,
+  value: string
+) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const allowed = [
+    "dealValue",
+    "probability",
+    "nextStep",
+    "expectedClosureDate",
+    "lostNotes",
+  ];
+  if (!allowed.includes(field)) return;
+
+  await updateDealQuery(dealId, { [field]: value || null });
+  revalidatePath(`/deals/${dealId}`);
+}
+
+export async function updateDealStatusAction(
+  dealId: string,
+  statusId: string
+) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const deal = await updateDealStatusQuery(dealId, statusId);
+
+  await createActivity({
+    referenceType: "deal",
+    referenceId: dealId,
+    type: "status_change",
+    direction: "outbound",
+    subject: "Statut modifié",
+    content: `Nouveau statut: ${deal?.statusId ?? statusId}`,
+  });
+
+  const { createNotification } = await import("@/lib/queries");
+  await createNotification({
+    type: "deal_status_change",
+    message: `Statut du deal modifié`,
+    referenceType: "deal",
+    referenceId: dealId,
+    read: false,
+  });
+
+  revalidatePath("/deals");
+  revalidatePath(`/deals/${dealId}`);
+}
+
+export async function markDealLostAction(
+  dealId: string,
+  lostReasonId: string,
+  lostNotes: string
+) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const defaultStatus = await getDefaultDealStatus();
+  await updateDealQuery(dealId, {
+    lostReasonId: lostReasonId || null,
+    lostNotes: lostNotes || null,
+    closedDate: new Date().toISOString().slice(0, 10),
+  });
+
+  await createActivity({
+    referenceType: "deal",
+    referenceId: dealId,
+    type: "status_change",
+    direction: "outbound",
+    subject: "Deal perdu",
+    content: lostNotes || "Marqué comme perdu",
+  });
+
+  revalidatePath(`/deals/${dealId}`);
+  revalidatePath("/deals");
+}
+
+export async function addDealNoteAction(dealId: string, content: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  if (!content.trim()) return;
+
+  await createActivity({
+    referenceType: "deal",
+    referenceId: dealId,
+    type: "note",
+    direction: "outbound",
+    subject: "Note",
+    content: content.trim(),
+  });
+
+  revalidatePath(`/deals/${dealId}`);
+}
+
+// ── Note actions ───────────────────────────────────────
+
+export async function createNoteAction(formData: FormData) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const content = String(formData.get("content") || "").trim();
+  if (!content) return;
+
+  const referenceType = String(formData.get("referenceType") || "") || null;
+  const referenceId = String(formData.get("referenceId") || "") || null;
+
+  await createNoteQuery({
+    title: String(formData.get("title") || "").trim() || null,
+    content,
+    referenceType: (referenceType as "lead" | "deal" | "contact" | "organization" | null) ?? null,
+    referenceId: referenceId || null,
+  });
+
+  if (referenceType && referenceId) {
+    revalidatePath(`/${referenceType === "lead" ? "leads" : referenceType === "deal" ? "deals" : referenceType + "s"}/${referenceId}`);
+  }
+  revalidatePath("/notes");
+}
+
+// ── Task actions ───────────────────────────────────────
+
+export async function createTaskAction(formData: FormData) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const title = String(formData.get("title") || "").trim();
+  if (!title) return;
+
+  const referenceType = String(formData.get("referenceType") || "") || null;
+  const referenceId = String(formData.get("referenceId") || "") || null;
+  const dueDate = String(formData.get("dueDate") || "") || null;
+
+  await createTaskQuery({
+    title,
+    priority: (String(formData.get("priority") || "medium") as "low" | "medium" | "high") ?? "medium",
+    status: "todo",
+    assignedTo: String(formData.get("assignedTo") || "").trim() || null,
+    dueDate: dueDate ? new Date(dueDate) : null,
+    description: String(formData.get("description") || "").trim() || null,
+    referenceType: (referenceType as "lead" | "deal" | "contact" | "organization" | null) ?? null,
+    referenceId: referenceId || null,
+  });
+
+  if (referenceType && referenceId) {
+    revalidatePath(`/${referenceType === "lead" ? "leads" : referenceType === "deal" ? "deals" : referenceType + "s"}/${referenceId}`);
+  }
+  revalidatePath("/tasks");
+}
+
+export async function updateTaskStatusAction(taskId: string, status: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  await updateTaskStatusQuery(taskId, status);
+  revalidatePath("/tasks");
+}
+
+export async function deleteTaskAction(taskId: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  await deleteTaskQuery(taskId);
+  revalidatePath("/tasks");
+}
+
+// ── Messaging actions ──────────────────────────────────
+
+export async function sendEmailAction(
+  referenceType: "lead" | "deal",
+  referenceId: string,
+  to: string,
+  subject: string,
+  content: string,
+  templateId?: string
+) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const { sendEmail, renderTemplate } = await import("@/lib/messaging/email");
+  const { renderEmailTemplate, markdownToEmailHtml, wrapWithBranding } = await import(
+    "@/lib/messaging/markdown"
+  );
+  const { getEmailBranding } = await import("@/lib/queries");
+  const branding = (await getEmailBranding()) ?? undefined;
+
+  // Sans modèle, le message tapé était injecté BRUT dans le corps HTML : ses
+  // retours à la ligne disparaissaient. Il passe maintenant par le même rendu,
+  // habillage compris — un envoi 1-à-1 porte le logo comme les autres.
+  let html = wrapWithBranding(markdownToEmailHtml(content, branding), branding);
+  if (templateId) {
+    const { getEmailTemplateById } = await import("@/lib/queries");
+    const tpl = await getEmailTemplateById(templateId);
+    if (tpl) {
+      // Les variables du lead ({{firstName}}, {{formation}}…) : sans elles,
+      // l'email partait avec « Bonjour , ».
+      let varsLead: Record<string, string> = {};
+      if (referenceType === "lead") {
+        const { getLeadById } = await import("@/lib/queries");
+        const { buildVariables, isArabic } = await import("@/lib/automations");
+        const lead = await getLeadById(referenceId);
+        if (lead) varsLead = buildVariables(lead, isArabic(tpl.content));
+      }
+      html = renderEmailTemplate(tpl.content, { ...varsLead, subject, content }, branding, {
+        enabled: tpl.buttonEnabled,
+        label: tpl.buttonLabel,
+        url: tpl.buttonUrl,
+        position: tpl.buttonPosition,
+      });
+      // Objet = texte brut, pas de HTML : substitution simple.
+      subject = renderTemplate(tpl.subject || subject, { ...varsLead, subject });
+    }
+  }
+
+  const result = await sendEmail({ to, subject, html });
+
+  if (!result.ok) {
+    return result;
+  }
+
+  await createActivity({
+    referenceType,
+    referenceId,
+    type: "email",
+    direction: "outbound",
+    subject,
+    content: html,
+  });
+
+  if (referenceType === "lead") {
+    await updateLeadQuery(referenceId, { lastContactedAt: new Date() });
+    revalidatePath(`/leads/${referenceId}`);
+  } else {
+    revalidatePath(`/deals/${referenceId}`);
+  }
+
+  return result;
+}
+
+export async function sendWhatsAppAction(
+  referenceType: "lead" | "deal",
+  referenceId: string,
+  to: string,
+  body: string
+) {
+  await requireUser();
+  await exiger("whatsapp", "gerer");
+  const { sendWhatsApp } = await import("@/lib/messaging/whatsapp");
+  const result = await sendWhatsApp({ to, body });
+
+  if (!result.ok) {
+    return result;
+  }
+
+  await createActivity({
+    referenceType,
+    referenceId,
+    type: "whatsapp",
+    direction: "outbound",
+    subject: "WhatsApp envoyé",
+    content: body,
+  });
+
+  if (referenceType === "lead") {
+    await updateLeadQuery(referenceId, { lastContactedAt: new Date() });
+    revalidatePath(`/leads/${referenceId}`);
+  } else {
+    revalidatePath(`/deals/${referenceId}`);
+  }
+
+  return result;
+}
+
+export async function logCallAction(
+  referenceType: "lead" | "deal",
+  referenceId: string,
+  formData: FormData
+) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const { createCallLog } = await import("@/lib/queries");
+
+  const type = String(formData.get("type") || "outgoing") as "incoming" | "outgoing";
+  const status = String(formData.get("status") || "completed") as never;
+  // L'écran saisit des minutes, call_logs.duration est en secondes.
+  const minutes = Number(formData.get("durationMinutes") || 0);
+  const duration = Number.isFinite(minutes) && minutes > 0 ? Math.round(minutes * 60) : 0;
+  const notes = String(formData.get("notes") || "").trim();
+
+  await createCallLog({
+    type,
+    status,
+    duration,
+    telephonyMedium: "manual",
+    referenceType,
+    referenceId,
+    startTime: new Date(),
+    endTime: new Date(),
+  });
+
+  await createActivity({
+    referenceType,
+    referenceId,
+    type: "call",
+    direction: type === "incoming" ? "inbound" : "outbound",
+    subject: `Appel ${type === "incoming" ? "entrant" : "sortant"}`,
+    content: notes || `Durée : ${Math.round(duration / 60)} min`,
+  });
+
+  if (referenceType === "lead") {
+    await updateLeadQuery(referenceId, { lastContactedAt: new Date() });
+    revalidatePath(`/leads/${referenceId}`);
+  } else {
+    revalidatePath(`/deals/${referenceId}`);
+  }
+  revalidatePath("/call-logs");
+}
+
+export async function addCommentAction(
+  referenceType: "lead" | "deal" | "contact" | "organization",
+  referenceId: string,
+  content: string
+) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  if (!content.trim()) return;
+
+  const { createComment } = await import("@/lib/queries");
+  await createComment({
+    referenceType,
+    referenceId,
+    content: content.trim(),
+  });
+
+  const pathMap: Record<string, string> = {
+    lead: "leads",
+    deal: "deals",
+    contact: "contacts",
+    organization: "organizations",
+  };
+  revalidatePath(`/${pathMap[referenceType]}/${referenceId}`);
+}
+
+// ── Email Template actions ─────────────────────────────
+
+export async function createEmailTemplateAction(formData: FormData) {
+  await requireUser();
+  await exiger("reglages", "gerer");
+  const name = String(formData.get("name") || "").trim();
+  const content = String(formData.get("content") || "").trim();
+  if (!name || !content) return;
+
+  const button = readButton(formData);
+  if (button.error) return;
+
+  const { createEmailTemplate } = await import("@/lib/queries");
+  await createEmailTemplate({
+    name,
+    subject: String(formData.get("subject") || "").trim() || null,
+    content,
+    ...button.values,
+  });
+
+  revalidatePath("/settings");
+}
+
+/**
+ * Champs du bouton principal. Un bouton activé sans libellé ou sans URL
+ * n'afficherait rien : on refuse plutôt que de laisser un modèle muet.
+ */
+function readButton(formData: FormData) {
+  const enabled = String(formData.get("buttonEnabled") || "") === "on";
+  const label = String(formData.get("buttonLabel") || "").trim();
+  const url = String(formData.get("buttonUrl") || "").trim();
+  const position = String(formData.get("buttonPosition") || "bottom") === "top" ? "top" : "bottom";
+
+  if (enabled && (!label || !url)) {
+    return { error: "Bouton activé : libellé et URL obligatoires.", values: {} };
+  }
+  if (enabled && !/^https?:\/\//i.test(url)) {
+    return { error: "L'URL du bouton doit commencer par https://", values: {} };
+  }
+  return {
+    error: null as string | null,
+    values: {
+      buttonEnabled: enabled,
+      buttonLabel: label || null,
+      buttonUrl: url || null,
+      buttonPosition: position,
+    },
+  };
+}
+
+export async function updateEmailTemplateAction(
+  id: string,
+  formData: FormData
+): Promise<{ ok: boolean; message: string }> {
+  await requireUser();
+  await exiger("reglages", "gerer");
+  const name = String(formData.get("name") || "").trim();
+  const content = String(formData.get("content") || "").trim();
+  if (!name || !content) {
+    return { ok: false, message: "Nom et contenu obligatoires." };
+  }
+
+  const button = readButton(formData);
+  if (button.error) return { ok: false, message: button.error };
+
+  const { updateEmailTemplate } = await import("@/lib/queries");
+  await updateEmailTemplate(id, {
+    name,
+    subject: String(formData.get("subject") || "").trim() || null,
+    content,
+    ...button.values,
+  });
+
+  revalidatePath("/settings");
+  return { ok: true, message: "Modèle enregistré." };
+}
+
+export async function deleteEmailTemplateAction(id: string) {
+  await requireUser();
+  await exiger("reglages", "gerer");
+  const { deleteEmailTemplate } = await import("@/lib/queries");
+  await deleteEmailTemplate(id);
+  revalidatePath("/settings");
+}
+
+// ── Collaborateurs (allowlist d'inscription) ───────────
+
+// Format volontairement permissif : la vraie validation, c'est que le
+// destinataire reçoive le mail. On écarte juste les saisies manifestement fausses.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export async function inviteCollaboratorAction(
+  formData: FormData
+): Promise<{ ok: boolean; message: string }> {
+  await requireUser();
+  await exigerProprietaire();
+
+  const email = String(formData.get("email") || "").trim().toLowerCase();
+  const note = String(formData.get("note") || "").trim() || null;
+
+  if (!EMAIL_RE.test(email)) {
+    return { ok: false, message: "Adresse email invalide." };
+  }
+
+  const { getAllowedEmailByAddress, createAllowedEmail } = await import("@/lib/queries");
+  const existing = await getAllowedEmailByAddress(email);
+  if (existing) {
+    return { ok: false, message: "Cet email est déjà autorisé." };
+  }
+
+  // Les droits choisis à l'invitation ; sans eux, les défauts d'un nouveau membre.
+  const { normaliser, DEFAUT_INVITATION } = await import("@/lib/droits-domaines");
+  const brut = formData.get("permissions");
+  let permissions = DEFAUT_INVITATION;
+  if (typeof brut === "string" && brut) {
+    try {
+      permissions = normaliser(JSON.parse(brut));
+    } catch {
+      return { ok: false, message: "Droits illisibles." };
+    }
+  }
+  await createAllowedEmail({ email, note, role: "membre", permissions });
+  // Une personne retirée puis réinvitée retrouve son compte (et son historique).
+  const { setAccountBlocked } = await import("@/lib/account-access");
+  await setAccountBlocked(email, false);
+  revalidatePath("/settings");
+
+  const { sendInviteEmail } = await import("@/lib/messaging/invite");
+  const sent = await sendInviteEmail(email);
+  if (!sent.ok) {
+    // L'autorisation est bien enregistrée : on ne la retire pas pour un échec
+    // d'envoi, on dit juste qu'il faut transmettre le lien à la main.
+    return {
+      ok: true,
+      message: `${email} est autorisé, mais l'email n'est pas parti (${sent.error}). Transmets-lui le lien /login à la main.`,
+    };
+  }
+
+  return { ok: true, message: `Invitation envoyée à ${email}.` };
+}
+
+/**
+ * La liste fermée du « encaissé par ».
+ *
+ * Exposée en action plutôt que passée en prop : la fenêtre d'inscription
+ * s'ouvre depuis le kanban ET depuis la fiche, et traverser deux composants
+ * entiers pour quatre adresses ne vaut pas le détour.
+ */
+/**
+ * Le conseil derrière une pastille ✦ des statistiques.
+ *
+ * Trois couches, dans cet ordre : une RÈGLE a détecté l'écart, une REQUÊTE
+ * fournit les gens concernés, et le modèle n'écrit que le « quoi faire ».
+ * Si le modèle tombe, le constat et la liste restent — ils ne dépendent que de
+ * la base, et c'est le plus utile des trois.
+ */
+export async function getStatsAdviceAction(bootcampId: string, block: string) {
+  await requireUser();
+  await exiger("stats", "voir");
+  if (block === "argent") await exiger("argent", "voir");
+  const { getFormationStats, getGapTargets, getBootcampById } = await import("@/lib/queries");
+  const { detectGaps } = await import("@/lib/stats-gaps");
+
+  const [stats, bootcamp] = await Promise.all([
+    getFormationStats(bootcampId),
+    getBootcampById(bootcampId),
+  ]);
+  const gap = detectGaps(stats).find((g) => g.block === block);
+  if (!gap) return { error: "Plus rien à signaler sur ce bloc." };
+
+  const cibles = gap.cibles
+    ? await getGapTargets(bootcampId, gap.cibles, gap.cibleArg)
+    : [];
+
+  const { adviseOnGap } = await import("@/lib/ai/stats-advice");
+  const res = await adviseOnGap(gap, cibles, { formation: bootcamp?.name ?? "" });
+
+  return {
+    ok: true,
+    constat: gap.constat,
+    cibles,
+    conseils: res.ok ? res.advice.conseils : [],
+    avertissement: res.ok ? null : res.message,
+  };
+}
+
+// ── Assistant conversationnel (lot 1 : lecture seule) ──
+
+/** Le fil de l'utilisateur courant, pour rouvrir le panneau là où il l'a laissé. */
+export async function getAssistantHistoryAction() {
+  const user = await requireUser();
+  const { assistantMessages } = await import("@/db/schema");
+  const { eq, asc } = await import("drizzle-orm");
+  const { db } = await import("@/db");
+
+  const rows = await db
+    .select()
+    .from(assistantMessages)
+    .where(eq(assistantMessages.userEmail, user.email ?? ""))
+    .orderBy(asc(assistantMessages.createdAt));
+
+  // Les 40 derniers suffisent à retrouver le fil ; au-delà on charge une
+  // conversation que personne ne fera défiler.
+  return rows.slice(-40).map((m) => ({ role: m.role, content: m.content }));
+}
+
+export async function askAssistantAction(question: string, contexte: string | null) {
+  const user = await requireUser();
+  const texte = question.trim();
+  if (!texte) return { error: "Question vide." };
+  if (texte.length > 4000) return { error: "Question trop longue." };
+
+  const email = user.email ?? "";
+  const { assistantMessages } = await import("@/db/schema");
+  const { eq, asc } = await import("drizzle-orm");
+  const { db } = await import("@/db");
+  const { askAssistant } = await import("@/lib/ai/assistant");
+
+  const passe = await db
+    .select()
+    .from(assistantMessages)
+    .where(eq(assistantMessages.userEmail, email))
+    .orderBy(asc(assistantMessages.createdAt));
+
+  const res = await askAssistant(
+    passe.slice(-10).map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
+    texte,
+    contexte
+  );
+
+  // La question est enregistrée même si la réponse échoue : sinon on ne
+  // comprend plus, en relisant le fil, à quoi l'erreur répondait.
+  await db.insert(assistantMessages).values({ userEmail: email, role: "user", content: texte });
+  const reponse = res.ok ? res.reponse : res.message;
+  await db.insert(assistantMessages).values({ userEmail: email, role: "assistant", content: reponse });
+
+  return { ok: true, reponse, outils: res.ok ? res.outils : [], echec: !res.ok };
+}
+
+export async function clearAssistantAction() {
+  const user = await requireUser();
+  const { assistantMessages } = await import("@/db/schema");
+  const { eq } = await import("drizzle-orm");
+  const { db } = await import("@/db");
+  await db.delete(assistantMessages).where(eq(assistantMessages.userEmail, user.email ?? ""));
+  return { ok: true };
+}
+
+/** Le code promo reconnu sur la fiche et les prix qu'il donne — pré-remplit l'inscription. */
+export async function codeDuLeadAction(leadId: string) {
+  await requireUser();
+  await exiger("argent", "voir");
+  const { codeDuLead } = await import("@/lib/promo");
+  return codeDuLead(leadId);
+}
+
+export async function getTeamAction() {
+  await requireUser();
+  const { getAllowedEmails } = await import("@/lib/queries");
+  const members = await getAllowedEmails();
+  // Seulement les comptes ACTIFS. Une adresse invitée qui n'a jamais créé son
+  // compte ne peut encaisser l'argent de personne : la proposer ouvrirait la
+  // porte à attribuer un versement à quelqu'un qui n'est pas encore là.
+  return members.filter((m) => m.active).map((m) => ({ email: m.email }));
+}
+
+export async function removeAllowedEmailAction(id: string): Promise<{ ok: boolean; message: string }> {
+  const user = await requireUser();
+  await exigerProprietaire();
+  const { deleteAllowedEmail, getAllowedEmailById } = await import("@/lib/queries");
+  const row = await getAllowedEmailById(id);
+  if (!row) return { ok: false, message: "Cette adresse n'est déjà plus dans l'équipe." };
+  // Se retirer soi-même bloquerait son propre compte, sans personne pour le rouvrir.
+  if (row.email.toLowerCase() === (user.email ?? "").toLowerCase()) {
+    return { ok: false, message: "Vous ne pouvez pas vous retirer vous-même." };
+  }
+  const estProprio = (r: { role: string }) => r.role === "proprietaire";
+  if (estProprio(row)) {
+    const { getAllowedEmails } = await import("@/lib/queries");
+    const proprios = (await getAllowedEmails()).filter(estProprio);
+    if (proprios.length <= 1) {
+      return { ok: false, message: "Impossible de retirer le dernier propriétaire." };
+    }
+  }
+  // Bloquer AVANT d'effacer l'invitation : si le blocage échoue, la personne
+  // reste visible dans la liste au lieu d'avoir accès sans y figurer.
+  const { setAccountBlocked } = await import("@/lib/account-access");
+  const echec = await setAccountBlocked(row.email, true);
+  if (echec) return { ok: false, message: `${row.email} n'a pas pu être bloqué (${echec}). Rien n'a été retiré.` };
+  await deleteAllowedEmail(id);
+  revalidatePath("/settings");
+  return { ok: true, message: `${row.email} est retiré de l'équipe : son compte est bloqué.` };
+}
+
+/** Les droits d'un membre (écran Équipe). Un propriétaire garde tout : non modifiable. */
+export async function updateMemberPermissionsAction(
+  id: string,
+  niveaux: Record<string, string>
+): Promise<{ ok: boolean; message: string }> {
+  await requireUser();
+  await exigerProprietaire();
+  const { getAllowedEmailById, updateAllowedEmailPermissions } = await import("@/lib/queries");
+  const { normaliser } = await import("@/lib/droits-domaines");
+  const row = await getAllowedEmailById(id);
+  if (!row) return { ok: false, message: "Cette adresse n'est plus dans l'équipe." };
+  if (row.role === "proprietaire") {
+    return { ok: false, message: "Un propriétaire a tous les droits : rien à modifier." };
+  }
+  await updateAllowedEmailPermissions(id, normaliser(niveaux));
+  revalidatePath("/settings");
+  return { ok: true, message: `Droits de ${row.email} enregistrés.` };
+}
+
+// ── Test d'un modèle d'email ───────────────────────────
+
+/** Valeurs d'exemple : identiques à celles de l'aperçu, pour que le mail reçu
+ *  corresponde à ce qui est affiché à l'écran. */
+const TEST_VARIABLES: Record<string, string> = {
+  firstName: "Amel",
+  lastName: "Ben Salah",
+  fullName: "Amel Ben Salah",
+  email: "amel@exemple.com",
+  formation: "Bootcamp september 2026",
+  dateDebut: "28 septembre 2026",
+  offre: "3× 500 TND",
+  subject: "Objet du message",
+  content: "Le message tapé dans la fiche du lead.",
+};
+
+export async function sendTestEmailAction(
+  to: string,
+  subject: string,
+  content: string,
+  button?: { enabled: boolean; label: string; url: string; position: string }
+): Promise<{ ok: boolean; message: string }> {
+  await requireUser();
+  if (!(await peut("reglages", "gerer"))) await exiger("campagnes", "gerer");
+
+  const address = to.trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address)) {
+    return { ok: false, message: "Adresse email invalide." };
+  }
+  if (!subject.trim()) {
+    return { ok: false, message: "Le modèle n'a pas d'objet — ajoute-le avant de tester." };
+  }
+  if (!content.trim()) {
+    return { ok: false, message: "Le contenu est vide." };
+  }
+
+  const { sendEmail, renderTemplate } = await import("@/lib/messaging/email");
+  const { renderEmailTemplate } = await import("@/lib/messaging/markdown");
+  const { getEmailBranding } = await import("@/lib/queries");
+  const branding = await getEmailBranding();
+
+  // Rendu STRICTEMENT identique à un envoi réel : même convertisseur, même
+  // habillage. Un test qui passerait par un autre chemin ne prouverait rien.
+  // La date de l'exemple suit la langue du texte, comme l'envoi réel : sinon le
+  // test afficherait « 28 septembre » là où le lead lira « 28 سبتمبر ».
+  const vars = /[\u0600-\u06FF]/.test(`${subject}${content}`)
+    ? { ...TEST_VARIABLES, dateDebut: "28 سبتمبر 2026" }
+    : TEST_VARIABLES;
+
+  const res = await sendEmail({
+    to: address,
+    subject: renderTemplate(subject, vars),
+    html: renderEmailTemplate(content, vars, branding ?? undefined, button),
+  });
+
+  if (!res.ok) return { ok: false, message: res.error ?? "Échec d'envoi." };
+  return { ok: true, message: `Test envoyé à ${address}.` };
+}
+
+// ── Images des emails ──────────────────────────────────
+
+export async function uploadEmailImageAction(
+  formData: FormData
+): Promise<{ ok: boolean; url?: string; message: string }> {
+  await requireUser();
+  if (!(await peut("reglages", "gerer"))) await exiger("campagnes", "gerer");
+  const file = formData.get("file");
+  if (!(file instanceof File) || file.size === 0) {
+    return { ok: false, message: "Aucun fichier." };
+  }
+
+  const { uploadEmailImage } = await import("@/lib/messaging/upload");
+  const res = await uploadEmailImage(file);
+  if (!res.ok) return { ok: false, message: res.message };
+  return { ok: true, url: res.url, message: res.warning ?? "Image envoyée." };
+}
+
+// ── Habillage des emails ───────────────────────────────
+
+export async function saveEmailBrandingAction(
+  formData: FormData
+): Promise<{ ok: boolean; message: string }> {
+  await requireUser();
+  await exiger("reglages", "gerer");
+
+  const str = (k: string) => String(formData.get(k) || "").trim();
+  const hex = (k: string, fallback: string) => {
+    const v = str(k);
+    return /^#[0-9a-f]{6}$/i.test(v) ? v : fallback;
+  };
+  const align = (k: string) => {
+    const v = str(k);
+    return v === "center" || v === "right" ? v : "left";
+  };
+
+  const logoUrl = str("logoUrl") || null;
+  const bannerImageUrl = str("bannerImageUrl") || null;
+  const width = parseInt(str("logoWidth") || "150", 10);
+  const logoWidth = Number.isFinite(width) && width > 0 ? Math.min(width, 560) : 150;
+
+  // Un client mail n'a pas de session : une URL relative ou en http afficherait
+  // une image cassée chez le destinataire, sans que rien ne le signale ici.
+  for (const [label, url] of [["logo", logoUrl], ["bannière", bannerImageUrl]] as const) {
+    if (url && !/^https:\/\//i.test(url)) {
+      return { ok: false, message: `L'URL du ${label} doit être absolue et en https://` };
+    }
+  }
+
+  // Toute couleur saisie doit être un hexadécimal complet : une valeur
+  // approximative passerait silencieusement et donnerait un email cassé.
+  for (const key of [
+    "accentColor", "bannerBg", "headerDivider", "bodyBg", "titleColor",
+    "textColor", "boldColor", "footnoteColor", "primaryBtnText",
+    "secondaryBtnBg", "secondaryBtnText", "secondaryBtnBorder",
+  ]) {
+    const v = str(key);
+    if (v && !/^#[0-9a-f]{6}$/i.test(v)) {
+      return { ok: false, message: `Couleur invalide sur « ${key} » (format attendu : #1a1a1a).` };
+    }
+  }
+
+  // ⚠️ Resend refuse toute adresse dont le domaine n'est pas vérifié : une
+  // faute de frappe ici ferait échouer TOUS les envois, sans message clair.
+  const senderEmail = str("senderEmail").toLowerCase() || null;
+  if (senderEmail) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(senderEmail)) {
+      return { ok: false, message: "Adresse d'expédition invalide." };
+    }
+    const { RESEND_SENDER_DOMAIN } = await import("@/lib/config");
+    if (RESEND_SENDER_DOMAIN && !senderEmail.endsWith("@" + RESEND_SENDER_DOMAIN.toLowerCase())) {
+      return {
+        ok: false,
+        message:
+          `L'adresse doit finir par @${RESEND_SENDER_DOMAIN} — le domaine vérifié chez Resend. ` +
+          "Une autre adresse ferait échouer tous les envois.",
+      };
+    }
+  }
+
+  const { saveEmailBranding } = await import("@/lib/queries");
+  await saveEmailBranding({
+    logoUrl,
+    logoWidth,
+    logoAlt: str("logoAlt") || null,
+    logoPosition: align("logoPosition"),
+    bannerBg: hex("bannerBg", "#ffffff"),
+    bannerImageUrl,
+    bannerTagline: str("bannerTagline") || null,
+    headerDivider: hex("headerDivider", "#e0e2ea"),
+    bodyBg: hex("bodyBg", "#ffffff"),
+    titleColor: hex("titleColor", "#212327"),
+    textColor: hex("textColor", "#5b616f"),
+    boldColor: hex("boldColor", "#212327"),
+    footnoteColor: hex("footnoteColor", "#a4a8b2"),
+    footerText: str("footerText") || null,
+    accentColor: hex("accentColor", "#1a1a1a"),
+    primaryBtnText: hex("primaryBtnText", "#ffffff"),
+    secondaryBtnBg: hex("secondaryBtnBg", "#ffffff"),
+    secondaryBtnText: hex("secondaryBtnText", "#3e64de"),
+    secondaryBtnBorder: hex("secondaryBtnBorder", "#3e64de"),
+    buttonPosition: align("buttonPosition"),
+    senderEmail,
+    senderName: str("senderName") || null,
+  });
+  revalidatePath("/settings");
+  return { ok: true, message: "Habillage enregistré." };
+}
+
+// ── Appel en un clic ───────────────────────────────────
+
+/** Qualifications proposées à l'appel. Courte volontairement : une liste
+ *  longue ne se clique pas, elle se contourne. */
+// PAS exportée : ce fichier porte "use server", qui n'autorise QUE des exports
+// de fonctions async. L'exporter faisait échouer l'évaluation du module —
+// donc TOUTE page important ce fichier (fiche lead, page formation).
+const CALL_QUALIFICATIONS = [
+  "chaud",
+  "tiede",
+  "froid",
+  "pas_serieux",
+  "hors_cible",
+  "reporte",
+] as const;
+
+/**
+ * Résultat d'un appel : ce qui s'est passé, comment on qualifie la personne,
+ * quand la rappeler, et ce qui s'est dit.
+ *
+ * L'état courant (qualification, prochaine relance) va sur le lead — c'est lui
+ * qui pilote la file. Le détail va dans call_logs + une activité attribuée,
+ * pour que l'associé voie qui a appelé et ce qui s'est dit.
+ */
+export async function logCallOutcomeAction(
+  leadId: string,
+  input: {
+    outcome: "answered" | "no_answer" | "wrong_number";
+    qualification?: string | null;
+    followUpDays?: number | null; // null = pas de rappel programmé
+    durationMinutes?: number | null;
+    note?: string | null;
+  }
+): Promise<{ ok: boolean; message: string }> {
+  await requireUser();
+  await exiger("leads", "gerer");
+
+  const { getLeadById, createCallLog, createActivity, updateLead } = await import(
+    "@/lib/queries"
+  );
+  const lead = await getLeadById(leadId);
+  if (!lead) return { ok: false, message: "Lead introuvable." };
+
+  const { currentActor } = await import("@/lib/auth");
+  const actor = await currentActor();
+
+  const qualification =
+    input.qualification && (CALL_QUALIFICATIONS as readonly string[]).includes(input.qualification)
+      ? (input.qualification as (typeof CALL_QUALIFICATIONS)[number])
+      : null;
+
+  const days = input.followUpDays;
+  const nextFollowUpAt =
+    days !== null && days !== undefined && Number.isFinite(days) && days >= 0
+      ? new Date(Date.now() + days * 86400_000)
+      : null;
+
+  const minutes = Number(input.durationMinutes ?? 0);
+  const duration = Number.isFinite(minutes) && minutes > 0 ? Math.round(minutes * 60) : 0;
+
+  await createCallLog({
+    type: "outgoing",
+    status:
+      input.outcome === "answered"
+        ? "completed"
+        : input.outcome === "wrong_number"
+          ? "failed"
+          : "no_answer",
+    duration,
+    telephonyMedium: "manual",
+    toNumber: lead.mobileNo,
+    callerId: actor, // call_logs n'a pas de created_by
+    startTime: new Date(),
+    referenceType: "lead",
+    referenceId: leadId,
+  });
+
+  const label =
+    input.outcome === "answered"
+      ? "Appel — joint"
+      : input.outcome === "wrong_number"
+        ? "Appel — faux numéro"
+        : "Appel — sans réponse";
+
+  const details = [
+    qualification ? `Qualification : ${qualification}` : null,
+    nextFollowUpAt ? `À rappeler le ${nextFollowUpAt.toLocaleDateString("fr-FR")}` : null,
+    duration ? `Durée : ${Math.round(duration / 60)} min` : null,
+    input.note?.trim() || null,
+  ].filter(Boolean);
+
+  await createActivity({
+    referenceType: "lead",
+    referenceId: leadId,
+    type: "call",
+    direction: "outbound",
+    subject: label,
+    content: details.join("\n"),
+  });
+
+  // Un faux numéro n'est pas un contact : ne pas prétendre l'avoir joint.
+  const patch: Record<string, unknown> = { nextFollowUpAt };
+  if (qualification) {
+    patch.qualification = qualification;
+    patch.qualifiedAt = new Date();
+  }
+  if (input.outcome !== "wrong_number") patch.lastContactedAt = new Date();
+  await updateLead(leadId, patch);
+
+  // Le rappel devient une tâche pour celui qui a passé l'appel. Sans ça,
+  // `next_follow_up_at` ne vit que dans la file d'« Aujourd'hui » : qui n'ouvre
+  // pas cet écran ne voit jamais qu'il doit rappeler quelqu'un.
+  if (nextFollowUpAt && actor) {
+    const { scheduleFollowUpTask } = await import("@/lib/queries");
+    await scheduleFollowUpTask({
+      leadId,
+      leadName: lead.fullName,
+      assignedTo: actor,
+      dueDate: nextFollowUpAt,
+    });
+    revalidatePath("/tasks");
+  }
+
+  revalidatePath("/aujourdhui");
+  revalidatePath(`/leads/${leadId}`);
+  return { ok: true, message: "Appel enregistré." };
+}
+
+/**
+ * Décale la prochaine relance sans passer par un appel (« Demain », « +3 j »
+ * de la fiche mobile). Même effet qu'un appel noté avec un délai : le champ
+ * qui fait remonter le lead dans « Aujourd'hui », et la tâche « Rappeler X ».
+ */
+export async function setLeadFollowUpAction(
+  leadId: string,
+  days: number
+): Promise<{ ok: boolean; message: string }> {
+  await requireUser();
+  await exiger("leads", "gerer");
+  if (!Number.isFinite(days) || days < 0 || days > 365) {
+    return { ok: false, message: "Délai invalide." };
+  }
+
+  const { getLeadById, updateLead, scheduleFollowUpTask } = await import("@/lib/queries");
+  const lead = await getLeadById(leadId);
+  if (!lead) return { ok: false, message: "Lead introuvable." };
+
+  const nextFollowUpAt = new Date(Date.now() + days * 86400_000);
+  await updateLead(leadId, { nextFollowUpAt });
+
+  const { currentActor } = await import("@/lib/auth");
+  const actor = await currentActor();
+  if (actor) {
+    await scheduleFollowUpTask({
+      leadId,
+      leadName: lead.fullName,
+      assignedTo: actor,
+      dueDate: nextFollowUpAt,
+    });
+    revalidatePath("/tasks");
+  }
+
+  revalidatePath("/aujourdhui");
+  revalidatePath(`/leads/${leadId}`);
+  return { ok: true, message: `Relance le ${nextFollowUpAt.toLocaleDateString("fr-FR")}` };
+}
+
+/**
+ * Passe un lead dans une colonne « perdu » en gardant POURQUOI. La raison vit
+ * dans le fil du lead (sujet « Raison de perte ») — pas de colonne en base
+ * pour l'instant ; les statistiques pourront la relire par ce sujet.
+ */
+export async function markLeadLostAction(
+  leadId: string,
+  statusId: string,
+  reason: string,
+  note?: string | null
+): Promise<{ ok: boolean; message: string }> {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const motif = reason.trim();
+  if (!motif) return { ok: false, message: "Choisis une raison." };
+
+  const { getLeadStatusKind } = await import("@/lib/queries");
+  if ((await getLeadStatusKind(statusId)) !== "lost") {
+    return { ok: false, message: "Cette colonne n'est pas une colonne « perdu »." };
+  }
+
+  await createActivity({
+    referenceType: "lead",
+    referenceId: leadId,
+    type: "note",
+    direction: "outbound",
+    subject: "Raison de perte",
+    content: [motif, note?.trim() || null].filter(Boolean).join("\n"),
+  });
+  await updateLeadStatusAction(leadId, statusId);
+  return { ok: true, message: `Perdu — ${motif}` };
+}
+
+// ── Report vers la formation suivante ──────────────────
+
+export async function carryLeadsOverAction(
+  fromBootcampId: string,
+  toBootcampId: string,
+  leadIds: string[]
+): Promise<{ ok: boolean; created: number; message: string }> {
+  await requireUser();
+  await exiger("leads", "gerer");
+
+  if (!toBootcampId || fromBootcampId === toBootcampId) {
+    return { ok: false, created: 0, message: "Choisis une formation de destination." };
+  }
+  if (leadIds.length === 0) {
+    return { ok: false, created: 0, message: "Aucun lead sélectionné." };
+  }
+
+  const { carryLeadsOver } = await import("@/lib/queries");
+  const { currentActor } = await import("@/lib/auth");
+  const created = (await carryLeadsOver(leadIds, toBootcampId, await currentActor())).length;
+
+  revalidatePath(`/bootcamps/${fromBootcampId}`);
+  revalidatePath(`/bootcamps/${toBootcampId}`);
+  revalidatePath("/aujourdhui");
+
+  const skipped = leadIds.length - created;
+  return {
+    ok: true,
+    created,
+    message:
+      created === 0
+        ? "Aucun report : ces personnes sont déjà dans la formation cible."
+        : `${created} lead(s) reporté(s)${skipped > 0 ? ` · ${skipped} déjà présent(s)` : ""}.`,
+  };
+}
+
+/**
+ * Depuis la fiche : envoyer CE lead vers une autre formation, dans la colonne
+ * choisie. Une nouvelle fiche naît (même personne), celle-ci reste pour
+ * l'historique ; l'entrée dans la colonne déclenche ses tags et envois,
+ * comme n'importe quelle autre arrivée.
+ */
+export async function carryLeadToAction(
+  leadId: string,
+  toBootcampId: string,
+  toStatusId: string
+): Promise<{ ok: boolean; message: string; leadId?: string }> {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const { carryLeadsOver, getLeadById } = await import("@/lib/queries");
+  const src = await getLeadById(leadId);
+  if (!src) return { ok: false, message: "Lead introuvable." };
+  if (!toBootcampId || !toStatusId || src.bootcampId === toBootcampId) {
+    return { ok: false, message: "Choisis une autre formation et une colonne." };
+  }
+
+  const { currentActor } = await import("@/lib/auth");
+  const [nouveau] = await carryLeadsOver([leadId], toBootcampId, await currentActor(), toStatusId);
+  if (!nouveau) {
+    return { ok: false, message: "Pas d'envoi : cette personne est déjà dans cette formation." };
+  }
+  const { runStatusAutomations } = await import("@/lib/automations");
+  await runStatusAutomations(nouveau, toStatusId);
+
+  revalidatePath(`/leads/${leadId}`);
+  if (src.bootcampId) revalidatePath(`/bootcamps/${src.bootcampId}`);
+  revalidatePath(`/bootcamps/${toBootcampId}`);
+  return { ok: true, message: "Lead envoyé.", leadId: nouveau };
+}
+
+// ── Dupliquer une formation ────────────────────────────
+
+export async function duplicateBootcampAction(
+  sourceId: string,
+  formData: FormData
+): Promise<{ ok: boolean; message: string; id?: string; aVerifier?: string[] }> {
+  await requireUser();
+  await exiger("formations", "gerer");
+  const name = String(formData.get("name") || "").trim();
+  if (!name) return { ok: false, message: "Donne un nom à la nouvelle formation." };
+  const slug = name.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+
+  const { duplicateBootcamp } = await import("@/lib/queries");
+  const { currentActor } = await import("@/lib/auth");
+  try {
+    const r = await duplicateBootcamp(
+      sourceId,
+      {
+        name,
+        slug,
+        startDate: String(formData.get("startDate") || "") || null,
+        endDate: String(formData.get("endDate") || "") || null,
+      },
+      await currentActor()
+    );
+    revalidatePath("/bootcamps");
+    // Une valeur tapée à la main (date, lien…) part telle quelle dans la copie :
+    // le 25/09, « 28 سبتمبر 2026 » s'est retrouvée dans le bienvenue d'octobre.
+    const { AUTOMATION_VARIABLES } = await import("@/lib/automations");
+    const connues = new Set<string>(AUTOMATION_VARIABLES);
+    const aVerifier = r.regles.flatMap((g) =>
+      g.variables
+        .filter((v) => v && !connues.has(v))
+        .map((v) => `Colonne « ${g.colonne} »${g.modele ? `, ${g.modele}` : ""} : « ${v} »`)
+    );
+    return {
+      ok: true,
+      aVerifier,
+      id: r.bootcamp.id,
+      message: `« ${name} » créée : ${r.colonnes} colonnes, ${r.automatisations} automatisation(s), ${r.formulaires} formulaire(s) basculé(s).`,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes("slug") || msg.includes("duplicate key")) {
+      return { ok: false, message: "Une formation porte déjà ce nom. Choisis-en un autre." };
+    }
+    return { ok: false, message: `Échec : ${msg}` };
+  }
+}
+
+// ── Lecture IA des leads ───────────────────────────────
+
+/**
+ * Analyse un LOT de leads, pas tous : une fonction serverless a une durée
+ * limitée. L'interface rappelle l'action tant qu'il en reste, ce qui donne
+ * aussi une progression visible plutôt qu'une attente muette.
+ */
+export async function analyzeLeadsAction(
+  bootcampId: string,
+  limit = 6
+): Promise<{
+  ok: boolean;
+  analysed: number;
+  unchanged: number;
+  errors: number;
+  remaining: number;
+  message?: string;
+}> {
+  await requireUser();
+  await exiger("leads", "gerer");
+
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return {
+      ok: false,
+      analysed: 0,
+      unchanged: 0,
+      errors: 0,
+      remaining: 0,
+      message: "Clé ANTHROPIC_API_KEY absente — ajoute-la dans les variables d'environnement.",
+    };
+  }
+
+  const { getLeadsToAnalyze, countLeadsToAnalyze } = await import("@/lib/queries");
+  const { analyzeLead } = await import("@/lib/ai/lead-insights");
+
+  const batch = await getLeadsToAnalyze(bootcampId, Math.min(Math.max(limit, 1), 10));
+  let analysed = 0;
+  let unchanged = 0;
+  let errors = 0;
+  let lastError: string | undefined;
+
+  // Séquentiel : en parallèle, N appels tiendraient N connexions DB ouvertes
+  // pendant toute la latence du modèle — le pool se figerait (gel Supavisor).
+  for (const lead of batch) {
+    const res = await analyzeLead(lead);
+    if (res.outcome === "analysé") analysed++;
+    else if (res.outcome === "inchangé") unchanged++;
+    else {
+      errors++;
+      lastError = res.error;
+    }
+  }
+
+  const remaining = await countLeadsToAnalyze(bootcampId);
+  revalidatePath(`/bootcamps/${bootcampId}`);
+
+  return {
+    ok: errors === 0,
+    analysed,
+    unchanged,
+    errors,
+    remaining,
+    message: lastError,
+  };
+}
+
+// ── Data Import ────────────────────────────────────────
+
+export type { BulkImportResult, BulkImportLeadsOptions } from "@/lib/import-csv";
+
+export async function bulkImportLeadsAction(
+  rows: Record<string, string>[],
+  fieldMapping: Record<string, string>,
+  opts?: BulkImportLeadsOptions
+): Promise<BulkImportResult> {
+  await requireUser();
+  await exiger("contacts", "gerer");
+  const { importLeads } = await import("@/lib/import-csv");
+  const res = await importLeads(rows, fieldMapping, opts);
+  revalidatePath("/leads");
+  return res;
+}
+
+export async function bulkImportContactsAction(
+  rows: Record<string, string>[],
+  fieldMapping: Record<string, string>
+): Promise<BulkImportResult> {
+  await requireUser();
+  await exiger("contacts", "gerer");
+  const { importContacts } = await import("@/lib/import-csv");
+  const res = await importContacts(rows, fieldMapping);
+  revalidatePath("/contacts");
+  return res;
+}
+
+// ── Notification actions ───────────────────────────────
+
+export async function markNotificationReadAction(id: string) {
+  await requireUser();
+  const { markNotificationRead } = await import("@/lib/queries");
+  await markNotificationRead(id);
+  // Pas de revalidatePath("/") : la cloche met déjà son état à jour elle-même, et
+  // revalider re-rendait toute la page courante (sur /leads : 3,7 Mo) pour rien.
+}
+
+export async function markAllNotificationsReadAction() {
+  await requireUser();
+  const { markAllNotificationsRead } = await import("@/lib/queries");
+  await markAllNotificationsRead();
+  // Pas de revalidatePath("/") : la cloche met déjà son état à jour elle-même, et
+  // revalider re-rendait toute la page courante (sur /leads : 3,7 Mo) pour rien.
+}
+
+// ── Saved View actions ─────────────────────────────────
+
+export async function saveViewAction(
+  routeName: string,
+  label: string,
+  viewType: string,
+  searchQuery: string,
+  isPublic: boolean
+) {
+  await requireUser();
+  const { createViewSetting } = await import("@/lib/queries");
+
+  const filters = searchQuery ? { q: searchQuery } : null;
+  const type = viewType === "kanban" ? "kanban" : "list";
+
+  await createViewSetting({
+    label,
+    routeName,
+    doctype: routeName,
+    type: type as "list" | "kanban" | "group_by",
+    filters: filters as never,
+    public: isPublic,
+    userId: null,
+  });
+
+  revalidatePath(`/${routeName}`);
+}
+
+export async function deleteViewAction(id: string, routeName: string) {
+  await requireUser();
+  const { deleteViewSetting } = await import("@/lib/queries");
+  await deleteViewSetting(id);
+  revalidatePath(`/${routeName}`);
+}
+
+// ── Connexion WordPress ────────────────────────────────
+
+/** Le seul site accepté : celui de WP_SITE_URL (avec ou sans « www. »). */
+async function wpHotesAutorises(): Promise<string[]> {
+  const { WP_SITE_URL } = await import("@/lib/config");
+  if (!WP_SITE_URL) return [];
+  try {
+    const h = new URL(WP_SITE_URL).hostname.toLowerCase().replace(/^www\./, "");
+    return [h, `www.${h}`];
+  } catch {
+    return [];
+  }
+}
+
+export async function saveWpConnectionAction(formData: FormData) {
+  await requireUser();
+  await exiger("reglages", "gerer");
+  const { normalizeSiteUrl } = await import("@/lib/wordpress");
+
+  const siteUrl = normalizeSiteUrl(String(formData.get("siteUrl") || ""));
+  const username = String(formData.get("username") || "").trim();
+  // Laissé vide = on conserve le mot de passe déjà en base.
+  const appPassword = String(formData.get("appPassword") || "").trim();
+
+  if (!siteUrl || !username) {
+    return { ok: false, message: "URL du site et nom d'utilisateur obligatoires." };
+  }
+
+  // Le serveur envoie le mot de passe WordPress à cette adresse : seule celle
+  // de l'école (WP_SITE_URL) est acceptée — sinon un compte connecté pourrait
+  // se faire envoyer le mot de passe enregistré en changeant l'adresse.
+  const autorises = await wpHotesAutorises();
+  if (!autorises.length) {
+    return { ok: false, message: "Définissez WP_SITE_URL (voir docs/wordpress.md)." };
+  }
+  let hote = "";
+  try {
+    const u = new URL(siteUrl);
+    hote = u.protocol === "https:" ? u.hostname.toLowerCase() : "";
+  } catch {
+    // adresse illisible : refusée ci-dessous
+  }
+  if (!autorises.includes(hote)) {
+    return { ok: false, message: `Seule l'adresse https://${autorises[0]} est acceptée.` };
+  }
+
+  const { saveWpConnection, getWpConnection } = await import("@/lib/queries");
+  const existing = await getWpConnection();
+  if (!appPassword && !existing) {
+    return { ok: false, message: "App Password obligatoire à la première configuration." };
+  }
+  // Garder l'ancien mot de passe n'a de sens que pour la même adresse.
+  if (!appPassword && existing && existing.siteUrl !== siteUrl) {
+    return { ok: false, message: "Nouvelle adresse : retape l'App Password." };
+  }
+
+  try {
+    await saveWpConnection({ siteUrl, username, appPassword: appPassword || undefined });
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : "Échec de l'enregistrement." };
+  }
+
+  revalidatePath("/settings");
+  return { ok: true, message: "Connexion enregistrée." };
+}
+
+export async function testWpConnectionAction() {
+  await requireUser();
+  await exiger("reglages", "gerer");
+  const { getWpConnection, recordWpConnectionTest } = await import("@/lib/queries");
+  const { testWpConnection } = await import("@/lib/wordpress");
+
+  const conn = await getWpConnection();
+  if (!conn) return { ok: false, message: "Aucune connexion enregistrée." };
+
+  const result = await testWpConnection({
+    siteUrl: conn.siteUrl,
+    username: conn.username,
+    appPassword: conn.appPassword,
+  });
+
+  await recordWpConnectionTest(result.ok, result.message);
+  revalidatePath("/settings");
+  return result;
+}
+
+// ── Lien formation ↔ formulaire Elementor ──────────────
+
+/** Liste les formulaires du site + indique lesquels sont déjà pris. */
+export async function listElementorFormsAction() {
+  await requireUser();
+  await exiger("formations", "gerer");
+  const { getWpConnection, getLinkedElementorForms } = await import("@/lib/queries");
+  const { listElementorForms } = await import("@/lib/wordpress");
+
+  const conn = await getWpConnection();
+  if (!conn) {
+    return { ok: false as const, message: "Connexion au site non configurée (Settings → Site).", forms: [] };
+  }
+
+  try {
+    const forms = await listElementorForms({
+      siteUrl: conn.siteUrl,
+      username: conn.username,
+      appPassword: conn.appPassword,
+    });
+    const linked = await getLinkedElementorForms();
+    const takenBy = new Map(
+      linked.map((l) => [l.elementorFormId, l.bootcampName ?? "une autre formation"])
+    );
+    return {
+      ok: true as const,
+      message: "",
+      forms: forms.map((f) => ({ ...f, takenBy: takenBy.get(f.id) ?? null })),
+    };
+  } catch (e) {
+    return {
+      ok: false as const,
+      message: e instanceof Error ? e.message : "Lecture des formulaires impossible.",
+      forms: [],
+    };
+  }
+}
+
+export async function linkElementorFormAction(
+  bootcampId: string,
+  elementorFormId: string,
+  label: string
+) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  const { getWpConnection, linkElementorForm } = await import("@/lib/queries");
+  const { getLatestSubmissionId } = await import("@/lib/wordpress");
+
+  const conn = await getWpConnection();
+  if (!conn) return { ok: false, message: "Connexion au site non configurée." };
+
+  // Curseur posé sur la dernière soumission existante : l'historique déjà
+  // stocké côté WordPress n'est PAS importé, seulement les suivantes.
+  let cursor: number | null = null;
+  try {
+    cursor = await getLatestSubmissionId(
+      { siteUrl: conn.siteUrl, username: conn.username, appPassword: conn.appPassword },
+      elementorFormId
+    );
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : "Site injoignable." };
+  }
+
+  // Tire la dernière soumission pour proposer un mapping de départ et afficher
+  // les vraies clés du formulaire dans l'éditeur (sinon mapping à l'aveugle).
+  let seedMapping: Record<string, string> = {};
+  let seedPayload: Record<string, string> | null = null;
+  if (cursor) {
+    try {
+      const { listSubmissionsAfter } = await import("@/lib/wordpress");
+      const { guessFieldMapping } = await import("@/lib/elementor-import");
+      const [sample] = await listSubmissionsAfter(
+        { siteUrl: conn.siteUrl, username: conn.username, appPassword: conn.appPassword },
+        elementorFormId,
+        cursor - 1,
+        1
+      );
+      if (sample) {
+        seedPayload = sample.values;
+        // Le mapping deviné ne reconnaît que les clés lisibles : les
+        // `field_xxxxx` d'Elementor seraient reperdus à chaque re-liaison.
+        // On repart donc du dernier mapping saisi pour CE formulaire, et on
+        // ne devine que les clés qu'il ne couvre pas (champ ajouté depuis).
+        const { getLastMappingForElementorForm } = await import("@/lib/queries");
+        const previous = await getLastMappingForElementorForm(elementorFormId);
+        const guessed = guessFieldMapping(sample.values);
+        seedMapping = previous ? { ...guessed, ...previous } : guessed;
+      }
+    } catch {
+      // Pas bloquant : le lien se fait, le mapping se remplira à la main.
+    }
+  }
+
+  try {
+    await linkElementorForm({
+      bootcampId,
+      elementorFormId,
+      name: label,
+      lastSubmissionId: cursor,
+      fieldMapping: seedMapping,
+      lastPayload: seedPayload,
+    });
+  } catch (e) {
+    // 23505 = l'index unique partiel a refusé : le formulaire est pris ailleurs.
+    const msg = e instanceof Error ? e.message : "";
+    if (msg.includes("form_sources_elementor_form_active_key")) {
+      return { ok: false, message: "Ce formulaire alimente déjà une autre formation. Déliez-le d'abord." };
+    }
+    return { ok: false, message: msg || "Échec du lien." };
+  }
+
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return {
+    ok: true,
+    message: cursor
+      ? `Lié. Les soumissions à partir de maintenant arriveront ici (historique ignoré, curseur #${cursor}).`
+      : "Lié. Ce formulaire n'a encore aucune soumission.",
+  };
+}
+
+export async function unlinkElementorFormAction(sourceId: string, bootcampId: string) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  const { unlinkElementorForm } = await import("@/lib/queries");
+  await unlinkElementorForm(sourceId);
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return { ok: true, message: "Formulaire délié." };
+}
+
+export async function setElementorMappingAction(
+  sourceId: string,
+  bootcampId: string,
+  mapping: Record<string, string>
+) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  const { setFieldMapping } = await import("@/lib/queries");
+  // Whitelist : on n'accepte que des colonnes connues (jamais statusId, bootcampId…)
+  const { MAPPABLE_FIELDS } = await import("@/lib/lead-intake");
+  const allowed = new Set<string>(MAPPABLE_FIELDS as readonly string[]);
+  const clean: Record<string, string> = {};
+  for (const [k, v] of Object.entries(mapping)) {
+    if (v && allowed.has(v)) clean[k] = v;
+  }
+  await setFieldMapping(sourceId, clean);
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return { ok: true, message: "Mapping enregistré." };
+}
+
+/**
+ * Import manuel de TOUS les formulaires liés à une formation, en un clic.
+ *
+ * Séquentiel, comme le cron : le pool postgres-js est dimensionné sur la
+ * concurrence d'UNE requête HTTP, et l'API WordPress n'aime pas les rafales.
+ * Un formulaire en échec n'arrête pas les autres — son erreur est nommée dans
+ * le récapitulatif, sinon un seul mapping cassé masquerait tout le reste.
+ */
+export async function importBootcampFormsAction(bootcampId: string) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  const { getWpConnection, getFormSourcesByBootcamp } = await import("@/lib/queries");
+  const { importElementorSource } = await import("@/lib/elementor-import");
+
+  const conn = await getWpConnection();
+  if (!conn) return { ok: false, message: "Connexion au site non configurée." };
+
+  const sources = (await getFormSourcesByBootcamp(bootcampId)).filter(
+    (s) => s.active && s.elementorFormId
+  );
+  if (sources.length === 0) {
+    return { ok: false, message: "Aucun formulaire lié à cette formation." };
+  }
+
+  const creds = {
+    siteUrl: conn.siteUrl,
+    username: conn.username,
+    appPassword: conn.appPassword,
+  };
+
+  let fetched = 0, created = 0, updated = 0, skipped = 0;
+  const skippedIds: number[] = [];
+  const errors: string[] = [];
+
+  for (const source of sources) {
+    const r = await importElementorSource(source, creds);
+    fetched += r.fetched;
+    created += r.created;
+    updated += r.updated;
+    skipped += r.skipped;
+    skippedIds.push(...r.skippedIds);
+    if (r.error) errors.push(`${source.name} : ${r.error}`);
+  }
+
+  revalidatePath(`/bootcamps/${bootcampId}`);
+
+  const scope = `${sources.length} formulaire(s)`;
+  if (errors.length > 0) {
+    return {
+      ok: false,
+      message: `${errors.join(" — ")} (${created} lead(s) créé(s) au total)`,
+    };
+  }
+  if (fetched === 0) return { ok: true, message: `${scope} — aucune nouvelle soumission.` };
+
+  const base = `${scope} — ${fetched} soumission(s), ${created} lead(s) créé(s), ${updated} mis à jour`;
+  if (skipped > 0) {
+    return {
+      ok: true,
+      message:
+        `${base}, ${skipped} ignorée(s) faute d'email ET de téléphone ` +
+        `(#${skippedIds.join(", #")}). Elles restent lisibles côté WordPress.`,
+    };
+  }
+  return { ok: true, message: `${base}.` };
+}
+
+/** Colonne d'arrivée + tags par défaut d'un formulaire Elementor lié. */
+export async function setElementorRoutingAction(
+  sourceId: string,
+  bootcampId: string,
+  targetStatusId: string | null,
+  tagIds: string[]
+) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  const { setFormSourceRouting, getLeadStatuses, getTags } = await import("@/lib/queries");
+
+  // La colonne doit appartenir au pipeline de CETTE formation, et ne peut pas
+  // être terminale : un import ne doit jamais poser un lead directement en
+  // « Inscrit » (l'inscription passe par enrollLeadAction, pas par le webhook).
+  if (targetStatusId) {
+    const stages = await getLeadStatuses(bootcampId);
+    const target = stages.find((s) => s.id === targetStatusId);
+    if (!target) return { ok: false, message: "Colonne inconnue pour cette formation." };
+    if (target.kind !== "normal") {
+      return { ok: false, message: "Une colonne terminale ne peut pas être la colonne d'arrivée." };
+    }
+  }
+
+  // Whitelist des tags : on n'écrit que des ids qui existent réellement.
+  const known = new Set((await getTags()).map((t) => t.id));
+  const clean = tagIds.filter((id) => known.has(id));
+
+  await setFormSourceRouting(sourceId, targetStatusId || null, clean);
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return { ok: true, message: "Routage enregistré." };
+}
+
+// ── Tags ───────────────────────────────────────────────
+
+// Palette alignée sur STATUS_COLORS (src/lib/utils.ts) : un tag ne peut porter
+// qu'une couleur que l'UI sait effectivement rendre.
+const TAG_COLORS = [
+  "gray", "blue", "purple", "green", "dark-green", "red", "orange", "amber",
+];
+
+export async function createTagAction(name: string, color: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const clean = name.trim();
+  if (!clean) return { ok: false, message: "Nom requis." };
+  if (clean.length > 40) return { ok: false, message: "40 caractères maximum." };
+  const safeColor = TAG_COLORS.includes(color) ? color : "gray";
+
+  const { createTag } = await import("@/lib/queries");
+  try {
+    await createTag({ name: clean, color: safeColor });
+  } catch (e) {
+    // `tags.name` est UNIQUE : on renvoie un message clair plutôt qu'un crash.
+    const msg = e instanceof Error ? e.message : "";
+    if (msg.includes("tags_name_unique") || msg.includes("duplicate key")) {
+      return { ok: false, message: `Le tag « ${clean} » existe déjà.` };
+    }
+    return { ok: false, message: "Création impossible." };
+  }
+  revalidatePath("/tags");
+  return { ok: true, message: `Tag « ${clean} » créé.` };
+}
+
+export async function updateTagAction(id: string, name: string, color: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const clean = name.trim();
+  if (!clean) return { ok: false, message: "Nom requis." };
+  const safeColor = TAG_COLORS.includes(color) ? color : "gray";
+
+  const { updateTag } = await import("@/lib/queries");
+  try {
+    await updateTag(id, { name: clean, color: safeColor });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "";
+    if (msg.includes("tags_name_unique") || msg.includes("duplicate key")) {
+      return { ok: false, message: `Le tag « ${clean} » existe déjà.` };
+    }
+    return { ok: false, message: "Modification impossible." };
+  }
+  revalidatePath("/tags");
+  return { ok: true, message: "Tag mis à jour." };
+}
+
+export async function deleteTagAction(id: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const { deleteTag, getAllFormSources, setFormSourceTagIds } = await import("@/lib/queries");
+
+  // `lead_tags` part en cascade (FK ON DELETE CASCADE). En revanche
+  // `form_sources.default_tag_ids` est un jsonb SANS clé étrangère : rien ne le
+  // nettoie tout seul, un tag supprimé y resterait comme id fantôme.
+  // Fait en JS plutôt qu'en SQL jsonb : lisible, testable, et indépendant des
+  // subtilités de paramétrage entre Drizzle et postgres-js.
+  for (const fs of await getAllFormSources()) {
+    const ids = (fs.defaultTagIds ?? []) as string[];
+    if (ids.includes(id)) {
+      await setFormSourceTagIds(fs.id, ids.filter((x) => x !== id));
+    }
+  }
+
+  await deleteTag(id);
+  revalidatePath("/tags");
+  return { ok: true, message: "Tag supprimé." };
+}
+
+/** Pose ou retire un tag sur un lead. */
+export async function toggleLeadTagAction(leadId: string, tagId: string, on: boolean) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const { attachTagToLead, detachTagFromLead } = await import("@/lib/queries");
+  if (on) await attachTagToLead(leadId, tagId);
+  else await detachTagFromLead(leadId, tagId);
+  revalidatePath(`/leads/${leadId}`);
+  return { ok: true, message: "" };
+}
+
+/** Appelée au montage de la fiche lead : éteint le marqueur « non traité ». */
+export async function markLeadSeenAction(leadId: string) {
+  await requireUser();
+  await exiger("leads", "voir");
+  const { markLeadSeen } = await import("@/lib/queries");
+  await markLeadSeen(leadId);
+  // Pas de revalidatePath ici : la fiche vient d'être rendue, et revalider
+  // relancerait un rendu complet pour un simple changement de marqueur.
+  // Le board se met à jour à sa prochaine visite.
+}
+
+export async function setBootcampArchivedAction(bootcampId: string, archived: boolean) {
+  await requireUser();
+  await exiger("formations", "gerer");
+  const { setBootcampArchived } = await import("@/lib/queries");
+  await setBootcampArchived(bootcampId, archived);
+  revalidatePath("/bootcamps");
+  revalidatePath(`/bootcamps/${bootcampId}`);
+  return {
+    ok: true,
+    message: archived
+      ? "Formation archivée. Ses formulaires n'importent plus de leads."
+      : "Formation désarchivée.",
+  };
+}
+
+// ── Doublons d'adresse email entre leads ───────────────
+
+export async function dismissDuplicateAction(leadId: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const { dismissDuplicate } = await import("@/lib/duplicates");
+  await dismissDuplicate(leadId);
+  revalidatePath(`/leads/${leadId}`);
+  return { ok: true as const };
+}
+
+export async function separateLeadAction(leadId: string) {
+  await requireUser();
+  await exiger("leads", "gerer");
+  const { separateLeadFromContact } = await import("@/lib/duplicates");
+  const r = await separateLeadFromContact(leadId);
+  revalidatePath(`/leads/${leadId}`);
+  return r;
+}
+
+// ── Profil du compte connecté ──────────────────────────
+// Chacun ne modifie que le sien : l'action part du compte porté par la session,
+// jamais d'un id passé en paramètre.
+export async function updateProfileAction(fd: FormData) {
+  const user = await requireUser();
+  const { createClient } = await import("@/lib/supabase/server");
+  const { uploadAvatar } = await import("@/lib/profiles");
+
+  const name = String(fd.get("name") ?? "").trim().slice(0, 60);
+
+  let avatarUrl: string | null = user.user_metadata?.avatar_url ?? null;
+  const file = fd.get("avatar");
+  if (file instanceof File && file.size > 0) {
+    const up = await uploadAvatar(user.id, file);
+    if (!up.ok) return { error: up.message };
+    avatarUrl = up.url;
+  }
+
+  const supabase = await createClient();
+  const { error } = await supabase.auth.updateUser({
+    data: { full_name: name || null, avatar_url: avatarUrl },
+  });
+  if (error) return { error: error.message };
+
+  // Le nom s'affiche dans la sidebar et dans chaque fil d'activité : tout le
+  // layout est à rafraîchir, pas seulement la page Settings.
+  revalidatePath("/", "layout");
+  return { ok: true as const, name: name || null, avatarUrl };
+}
+
+export async function signOutAction() {
+  const { createClient } = await import("@/lib/supabase/server");
+  const { redirect } = await import("next/navigation");
+  const supabase = await createClient();
+  await supabase.auth.signOut();
+  redirect("/login");
+}
+
+// ── Votre école ────────────────────────────────────────
+
+/** Réglages → Votre école : une seule ligne, créée au premier enregistrement. */
+export async function saveOrganisationAction(input: {
+  nom: string;
+  description: string;
+  langue: string;
+  adresse: string;
+  latitude: number | null;
+  longitude: number | null;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  await requireUser();
+  await exiger("reglages", "gerer");
+  const { latitude, longitude } = input;
+  if ((latitude === null) !== (longitude === null)) {
+    return { ok: false, error: "Renseignez la latitude ET la longitude, ou aucune des deux." };
+  }
+  if (latitude !== null && (!Number.isFinite(latitude) || Math.abs(latitude) > 90)) {
+    return { ok: false, error: "Latitude invalide (entre -90 et 90)." };
+  }
+  if (longitude !== null && (!Number.isFinite(longitude) || Math.abs(longitude) > 180)) {
+    return { ok: false, error: "Longitude invalide (entre -180 et 180)." };
+  }
+  const valeurs = {
+    nom: input.nom.trim().slice(0, 200),
+    description: input.description.trim().slice(0, 2000),
+    langue: input.langue.trim().slice(0, 200),
+    adresse: input.adresse.trim().slice(0, 500),
+    latitude,
+    longitude,
+    updatedAt: new Date(),
+  };
+  const { db } = await import("@/db");
+  const { organisation } = await import("@/db/schema");
+  await db
+    .insert(organisation)
+    .values({ id: true, ...valeurs })
+    .onConflictDoUpdate({ target: organisation.id, set: valeurs });
+  revalidatePath("/settings");
+  return { ok: true };
+}

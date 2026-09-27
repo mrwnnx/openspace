@@ -1,0 +1,4039 @@
+import "server-only";
+import { currentActor } from "@/lib/auth";
+import { db, type DbExecutor } from "@/db";
+import {
+  leads,
+  leadStatuses,
+  leadSources,
+  industries,
+  organizations,
+  activities,
+  tasks,
+  notes,
+  deals,
+  dealStatuses,
+  dealContacts,
+  dealProducts,
+  contacts,
+  territories,
+  lostReasons,
+  emailTemplates,
+  comments,
+  callLogs,
+  notifications,
+  viewSettings,
+  bootcamps,
+  tags,
+  leadTags,
+  paymentSchedules,
+  formSources,
+  noteTemplates,
+  stageHistory,
+  wpConnection,
+  allowedEmails,
+  emailBranding,
+  automations,
+  automationLinkClicks,
+  automationRuns,
+  stageTags,
+  leadInsights,
+} from "@/db/schema";import { eq, desc, asc, ilike, or, and, sql, inArray } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
+import { APP_TIMEZONE } from "@/lib/config";
+
+// ── Bootcamps (Formations) ─────────────────────────────
+
+// Formation par défaut créée par la migration 0002. Les leads ne peuvent pas
+// avoir bootcamp_id = NULL (NOT NULL), donc on y rattache les leads orphelins.
+export const DEFAULT_BOOTCAMP_ID = "00000000-0000-0000-0000-000000000001";
+
+export type BootcampWithLeadCount = typeof bootcamps.$inferSelect & {
+  leadCount: number;
+  /** Leads posés dans la colonne « Inscrit » (stage kind = 'converted') — ce que montre le kanban. */
+  enrolledCount: number;
+};
+
+export async function getBootcamps(
+  opts?: { includeArchived?: boolean }
+): Promise<BootcampWithLeadCount[]> {
+  const all = await db.query.bootcamps.findMany({
+    where: opts?.includeArchived ? undefined : sql`${bootcamps.archivedAt} is null`,
+    orderBy: [desc(bootcamps.createdAt)],
+  });
+
+  // Count leads per bootcamp — et les inscrits dans le même passage : un seul
+  // agrégat, aucune ligne de lead ne remonte (le transfert Supabase est compté).
+  const counts = await db
+    .select({
+      bootcampId: leads.bootcampId,
+      count: sql<number>`count(*)::int`,
+      enrolled: sql<number>`count(*) filter (where ${leadStatuses.kind} = 'converted')::int`,
+    })
+    .from(leads)
+    .leftJoin(leadStatuses, eq(leadStatuses.id, leads.statusId))
+    .groupBy(leads.bootcampId);
+
+  const countMap = new Map(counts.map((c) => [c.bootcampId, c]));
+
+  return all.map((b) => ({
+    ...b,
+    leadCount: countMap.get(b.id)?.count ?? 0,
+    enrolledCount: countMap.get(b.id)?.enrolled ?? 0,
+  }));
+}
+
+export async function getBootcampById(id: string) {
+  return db.query.bootcamps.findFirst({
+    where: eq(bootcamps.id, id),
+  });
+}
+
+export async function createBootcamp(data: typeof bootcamps.$inferInsert) {
+  const [bootcamp] = await db.insert(bootcamps).values(data).returning();
+  // Clone le pipeline modèle pour cette nouvelle formation
+  await cloneDefaultPipeline(bootcamp.id);
+  // Sème les 2 stages système (Converti / Lost) si absents (Phase 1)
+  await ensureSystemStages(bootcamp.id);
+  return bootcamp;
+}
+
+export async function updateBootcamp(
+  id: string,
+  data: Partial<typeof bootcamps.$inferInsert>
+) {
+  const [bootcamp] = await db
+    .update(bootcamps)
+    .set({ ...data, updatedAt: new Date() })
+    .where(eq(bootcamps.id, id))
+    .returning();
+  return bootcamp;
+}
+
+export async function deleteBootcamp(id: string) {
+  if (id === DEFAULT_BOOTCAMP_ID) {
+    throw new Error("La formation par défaut ne peut pas être supprimée.");
+  }
+  // Réaffecte les leads à la formation par défaut + remet leur statut sur la
+  // colonne par défaut du pipeline cible (les statuts du bootcamp supprimé
+  // vont disparaître, il ne faut pas laisser de statusId dangling).
+  const defaultStatus = await getDefaultLeadStatus(DEFAULT_BOOTCAMP_ID);
+  await db
+    .update(leads)
+    .set({
+      bootcampId: DEFAULT_BOOTCAMP_ID,
+      statusId: defaultStatus?.id ?? null,
+      updatedAt: new Date(),
+    })
+    .where(eq(leads.bootcampId, id));
+  // Supprime les statuts liés à cette formation
+  await db.delete(leadStatuses).where(eq(leadStatuses.bootcampId, id));
+  // Supprime la formation
+  await db.delete(bootcamps).where(eq(bootcamps.id, id));
+}
+
+// Pipeline modèle : EXACTEMENT 5 colonnes pour chaque nouvelle formation,
+// dont les 2 colonnes SYSTÈME terminales (Inscrit=converted, Perdu=lost).
+// ensureSystemStages (appelé ensuite par createBootcamp) devient alors un no-op.
+const DEFAULT_PIPELINE_STAGES: {
+  name: string;
+  color: string;
+  position: number;
+  isDefault: boolean;
+  kind: "normal" | "converted" | "lost";
+  isSystem: boolean;
+}[] = [
+  { name: "Nouveau", color: "blue", position: 0, isDefault: true, kind: "normal", isSystem: false },
+  { name: "Contacté", color: "yellow", position: 1, isDefault: false, kind: "normal", isSystem: false },
+  { name: "Intéressé", color: "green", position: 2, isDefault: false, kind: "normal", isSystem: false },
+  { name: "Inscrit", color: "purple", position: 3, isDefault: false, kind: "converted", isSystem: true },
+  { name: "Perdu", color: "red", position: 4, isDefault: false, kind: "lost", isSystem: true },
+];
+
+export async function cloneDefaultPipeline(bootcampId: string) {
+  await db.insert(leadStatuses).values(
+    DEFAULT_PIPELINE_STAGES.map((stage) => ({
+      ...stage,
+      bootcampId,
+    }))
+  );
+}
+
+// ── Colonnes (stages) : CRUD pour la gestion dans le board ──
+
+export async function getLeadStatusById(id: string) {
+  return db.query.leadStatuses.findFirst({ where: eq(leadStatuses.id, id) });
+}
+
+export async function countLeadsByStatus(statusId: string) {
+  const [row] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(leads)
+    .where(eq(leads.statusId, statusId));
+  return row?.count ?? 0;
+}
+
+export async function createStage(bootcampId: string, name: string) {
+  const existing = await db.query.leadStatuses.findMany({
+    where: eq(leadStatuses.bootcampId, bootcampId),
+  });
+  const maxPos = existing.reduce((m, s) => Math.max(m, s.position), -1);
+  const [stage] = await db
+    .insert(leadStatuses)
+    .values({
+      bootcampId,
+      name,
+      color: "gray",
+      position: maxPos + 1,
+      isDefault: false,
+      isSystem: false,
+      kind: "normal",
+    })
+    .returning();
+  return stage;
+}
+
+export async function renameStage(statusId: string, name: string) {
+  await db.update(leadStatuses).set({ name }).where(eq(leadStatuses.id, statusId));
+}
+
+export async function deleteStage(statusId: string) {
+  await db.delete(leadStatuses).where(eq(leadStatuses.id, statusId));
+}
+
+// ── Lead Statuses (par bootcamp) ────────────────────────
+
+export async function getLeadStatuses(bootcampId?: string) {
+  return db.query.leadStatuses.findMany({
+    where: bootcampId ? eq(leadStatuses.bootcampId, bootcampId) : undefined,
+    orderBy: [asc(leadStatuses.position)],
+  });
+}
+
+export async function getDefaultLeadStatus(bootcampId?: string) {
+  return db.query.leadStatuses.findFirst({
+    where: and(
+      eq(leadStatuses.isDefault, true),
+      bootcampId ? eq(leadStatuses.bootcampId, bootcampId) : sql`true`
+    ),
+  });
+}
+
+// Colonne d'entrée d'une formation : la colonne par défaut, sinon la première (une formation archivée n'en a pas toujours).
+export async function getEntryLeadStatus(bootcampId: string) {
+  const def = await getDefaultLeadStatus(bootcampId);
+  if (def) return def;
+  return db.query.leadStatuses.findFirst({
+    where: eq(leadStatuses.bootcampId, bootcampId),
+    orderBy: [asc(leadStatuses.position)],
+  });
+}
+
+// ── Lead Sources / Industries ──────────────────────────
+
+export async function getLeadSources() {
+  return db.query.leadSources.findMany();
+}
+
+export async function getIndustries() {
+  return db.query.industries.findMany();
+}
+
+// ── Leads: List ────────────────────────────────────────
+
+export type LeadWithRelations = typeof leads.$inferSelect & {
+  status: typeof leadStatuses.$inferSelect | null;
+  source: typeof leadSources.$inferSelect | null;
+  industry: typeof industries.$inferSelect | null;
+  organization: typeof organizations.$inferSelect | null;
+  bootcamp: typeof bootcamps.$inferSelect | null;
+};
+
+type LeadFilters = {
+  search?: string;
+  bootcampId?: string;
+  statusId?: string;
+  temperature?: "hot" | "cold";
+  converted?: boolean;
+  tagIds?: string[];
+  tagMode?: "any" | "all"; // any = au moins un des tags ; all = tous
+};
+
+// Les mêmes filtres pour la page de leads et pour leur total (la pagination).
+function leadFilters(opts?: LeadFilters) {
+  const filters: ReturnType<typeof and>[] = [];
+
+  if (opts?.search) {
+    filters.push(
+      or(
+        ilike(leads.fullName, `%${opts.search}%`),
+        ilike(leads.email, `%${opts.search}%`),
+        ilike(leads.mobileNo, `%${opts.search}%`),
+        ilike(leads.organizationName, `%${opts.search}%`)
+      )
+    );
+  }
+  if (opts?.bootcampId) filters.push(eq(leads.bootcampId, opts.bootcampId));
+  if (opts?.statusId) filters.push(eq(leads.statusId, opts.statusId));
+  if (opts?.temperature) filters.push(eq(leads.temperature, opts.temperature));
+  if (opts?.converted !== undefined) filters.push(eq(leads.converted, opts.converted));
+  if (opts?.tagIds && opts.tagIds.length > 0) {
+    // Identifiants en clair : dans un where de db.query, Drizzle réécrirait ${leadTags.leadId} avec l'alias de "leads".
+    // Un tableau dans ${} devient un tuple ($1, $2) — d'où le `in`, pas `= any(...::uuid[])`.
+    filters.push(
+      opts.tagMode === "all"
+        ? sql`(select count(distinct lt.tag_id) from lead_tags lt where lt.lead_id = ${leads.id} and lt.tag_id in ${opts.tagIds}) = ${opts.tagIds.length}`
+        : sql`exists (select 1 from lead_tags lt where lt.lead_id = ${leads.id} and lt.tag_id in ${opts.tagIds})`
+    );
+  }
+  return filters.length > 0 ? and(...filters) : undefined;
+}
+
+export async function getLeads(opts?: LeadFilters & { limit?: number; offset?: number }) {
+  // Seulement ce que la liste et le dashboard affichent. Audit du 22/09 : la
+  // version « toutes colonnes + 5 relations complètes » pesait 12,2 Mo pour
+  // 10 831 leads (raw_payload compris), à chaque ouverture de /leads — l'essentiel
+  // du quota d'egress Supabase (5,93 Go / 5 Go). Ainsi : 3,7 Mo.
+  return db.query.leads.findMany({
+    where: leadFilters(opts),
+    columns: {
+      id: true,
+      fullName: true,
+      email: true,
+      mobileNo: true,
+      jobTitle: true,
+      bootcampId: true,
+      converted: true,
+      temperature: true,
+      lastContactedAt: true,
+    },
+    with: {
+      status: { columns: { name: true, color: true } },
+      source: { columns: { name: true } },
+      bootcamp: { columns: { name: true } },
+    },
+    // L'id départage les leads créés au même instant (imports) : sans lui, un
+    // lead pourrait sauter d'une page à l'autre.
+    orderBy: [desc(leads.createdAt), desc(leads.id)],
+    limit: opts?.limit,
+    offset: opts?.offset,
+  });
+}
+
+export async function countLeads(opts?: LeadFilters) {
+  const [r] = await db.select({ n: sql<number>`count(*)::int` }).from(leads).where(leadFilters(opts));
+  return r?.n ?? 0;
+}
+
+export type LeadListItem = Awaited<ReturnType<typeof getLeads>>[number];
+
+// ── Leads: Kanban (grouped by status) ──────────────────
+
+export async function getLeadsKanban(bootcampId?: string) {
+  const statuses = await db.query.leadStatuses.findMany({
+    where: bootcampId ? eq(leadStatuses.bootcampId, bootcampId) : undefined,
+    orderBy: [asc(leadStatuses.position)],
+    with: {
+      leads: {
+        // Un lead reporté vers une autre formation n'a plus rien à faire dans
+        // ces colonnes : sa suite se joue sur sa nouvelle fiche.
+        where: (l) => sql`not exists (select 1 from leads c where c.carried_from_lead_id = ${l.id})`,
+        // N'embarque PAS raw_payload (jsonb, inutile pour le board) — robustesse perf.
+        columns: { rawPayload: false },
+        orderBy: [desc(leads.createdAt)],
+        with: {
+          source: true,
+          organization: true,
+        },
+      },
+    },
+  });
+
+  // Dernière intervention HUMAINE par lead, pour la pastille de la vignette.
+  // Une seule requête pour tout le board, exécutée APRÈS celle des statuts et
+  // pas en parallèle : la page formation en tire déjà 6 de front et le pool
+  // postgres-js est calibré sur cette concurrence (cf. gotcha Supavisor).
+  const leadIds = statuses.flatMap((s) => s.leads.map((l) => l.id));
+  const lastActors = new Map<string, string>();
+  const derniereAction = new Map<string, Date>();
+  if (leadIds.length > 0) {
+    const rows = await db
+      .selectDistinctOn([activities.referenceId], {
+        leadId: activities.referenceId,
+        actor: activities.createdBy,
+        at: activities.createdAt,
+      })
+      .from(activities)
+      .where(
+        and(
+          eq(activities.referenceType, "lead"),
+          inArray(activities.referenceId, leadIds),
+          // Les marqueurs système ("webhook") ne sont pas des intervenants.
+          sql`${activities.createdBy} like '%@%'`
+        )
+      )
+      .orderBy(activities.referenceId, desc(activities.createdAt));
+    for (const r of rows) {
+      if (r.leadId && r.actor) lastActors.set(r.leadId, r.actor);
+      if (r.leadId && r.at) derniereAction.set(r.leadId, r.at);
+    }
+  }
+
+  // « Sans action depuis 48 h » (27/09) : dans une colonne en cours, personne de
+  // l'équipe n'a rien fait depuis 2 jours (ni depuis son arrivée dans la colonne).
+  const maintenant = Date.now();
+  return statuses.map((stage) => ({
+    ...stage,
+    leads: stage.leads.map((l) => {
+      const repere = derniereAction.get(l.id) ?? l.stageEnteredAt ?? l.createdAt;
+      const jours = repere ? Math.floor((maintenant - new Date(repere).getTime()) / 86_400_000) : 0;
+      return {
+        ...l,
+        lastActor: lastActors.get(l.id) ?? null,
+        sansActionJours: stage.kind === "normal" && jours >= 2 ? jours : null,
+      };
+    }),
+  }));
+}
+
+// ── Leads: Detail ──────────────────────────────────────
+
+export async function getLeadById(id: string) {
+  const lead = await db.query.leads.findFirst({
+    where: eq(leads.id, id),
+    with: {
+      status: true,
+      source: true,
+      industry: true,
+      organization: true,
+      bootcamp: true,
+      contact: true,
+      formSource: true,
+      deals: {
+        orderBy: [desc(deals.createdAt)],
+      },
+    },
+  });
+  if (!lead) return null;
+
+  const [leadActivities, leadTasks, leadNotes, leadComments] = await Promise.all([
+    db.query.activities.findMany({
+      where: and(
+        eq(activities.referenceType, "lead"),
+        eq(activities.referenceId, id)
+      ),
+      orderBy: [desc(activities.createdAt)],
+    }),
+    db.query.tasks.findMany({
+      where: and(eq(tasks.referenceType, "lead"), eq(tasks.referenceId, id)),
+      orderBy: [desc(tasks.createdAt)],
+    }),
+    db.query.notes.findMany({
+      where: and(eq(notes.referenceType, "lead"), eq(notes.referenceId, id)),
+      orderBy: [desc(notes.createdAt)],
+    }),
+    db.query.comments.findMany({
+      where: and(eq(comments.referenceType, "lead"), eq(comments.referenceId, id)),
+      orderBy: [desc(comments.createdAt)],
+    }),
+  ]);
+
+  return {
+    ...lead,
+    activities: leadActivities,
+    tasks: leadTasks,
+    notes: leadNotes,
+    comments: leadComments,
+  };
+}
+
+// ── Leads: Mutations ───────────────────────────────────
+
+export async function createLead(data: typeof leads.$inferInsert) {
+  const [lead] = await db.insert(leads).values(data).returning();
+  await inheritContactTags(lead.id, lead.contactId);
+  return lead;
+}
+
+export async function updateLead(
+  id: string,
+  data: Partial<typeof leads.$inferInsert>
+) {
+  const [lead] = await db
+    .update(leads)
+    .set({ ...data, updatedAt: new Date() })
+    .where(eq(leads.id, id))
+    .returning();
+  return lead;
+}
+
+export async function updateLeadStatus(leadId: string, statusId: string) {
+  const [lead] = await db
+    .update(leads)
+    .set({ statusId, updatedAt: new Date() })
+    .where(eq(leads.id, leadId))
+    .returning();
+  return lead;
+}
+
+/**
+ * Ce qui empêche de supprimer ce lead, en clair. Vide = suppression possible.
+ *
+ * Les deux liens sont en `ON DELETE NO ACTION` : sans ce contrôle, le DELETE
+ * remonte une violation de contrainte Postgres illisible à l'écran.
+ */
+export async function getLeadDeleteBlockers(id: string): Promise<string[]> {
+  const out: string[] = [];
+
+  const dealRows = await db.execute<{ n: number }>(
+    sql`select count(*)::int as n from deals where lead_id = ${id}`
+  );
+  if ((dealRows[0]?.n ?? 0) > 0) {
+    out.push("Ce lead est rattaché à un deal — supprimez le deal d'abord.");
+  }
+
+  const carried = await db.execute<{ name: string }>(
+    sql`select b.name
+        from leads l join bootcamps b on b.id = l.bootcamp_id
+        where l.carried_from_lead_id = ${id}
+        limit 1`
+  );
+  if (carried[0]) {
+    out.push(`Ce lead a été reporté vers « ${carried[0].name} » — supprimez la copie d'abord.`);
+  }
+
+  return out;
+}
+
+/**
+ * Suppression définitive.
+ *
+ * Les six tables à référence polymorphe n'ont AUCUNE clé étrangère vers `leads` :
+ * elles ne cascadent pas et ne bloquent pas. Sans ce ménage, 226 activités,
+ * 41 notifications et l'historique d'appel resteraient en base, orphelins.
+ * Tout dans une transaction : un ménage à moitié fait serait pire que rien.
+ */
+export async function deleteLead(id: string) {
+  await db.transaction(async (tx) => {
+    for (const table of [
+      "activities",
+      "call_logs",
+      "comments",
+      "notes",
+      "notifications",
+      "tasks",
+    ]) {
+      await tx.execute(
+        sql`delete from ${sql.raw(table)} where reference_type = 'lead' and reference_id = ${id}`
+      );
+    }
+    await tx.delete(leads).where(eq(leads.id, id));
+  });
+}
+
+// ── Activities ─────────────────────────────────────────
+
+export async function createActivity(data: typeof activities.$inferInsert) {
+  // Auteur par défaut = le compte connecté. Rempli ICI plutôt qu'aux ~10 points
+  // d'appel : un oubli au prochain point d'appel rendrait l'événement anonyme
+  // sans que rien ne le signale. Un appelant qui précise `createdBy` (l'import
+  // pose "webhook") garde la main.
+  const createdBy =
+    data.createdBy !== undefined ? data.createdBy : await currentActor();
+  const [activity] = await db
+    .insert(activities)
+    .values({ ...data, createdBy })
+    .returning();
+  return activity;
+}
+
+// ── Stats ──────────────────────────────────────────────
+
+export async function getLeadStats() {
+  const total = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(leads);
+  const converted = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(leads)
+    .where(eq(leads.converted, true));
+  const contactedThisWeek = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(leads)
+    .where(sql`${leads.lastContactedAt} > now() - interval '7 days'`);
+
+  return {
+    total: total[0]?.count ?? 0,
+    converted: converted[0]?.count ?? 0,
+    contactedThisWeek: contactedThisWeek[0]?.count ?? 0,
+  };
+}
+
+export async function getDealStats() {
+  const total = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(deals);
+  const won = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(deals)
+    .where(sql`EXISTS (SELECT 1 FROM deal_statuses WHERE id = deals.status_id AND name = 'Won')`);
+
+  const totalValue = await db
+    .select({ sum: sql<number>`coalesce(sum(deal_value), 0)::numeric` })
+    .from(deals);
+
+  return {
+    total: total[0]?.count ?? 0,
+    won: won[0]?.count ?? 0,
+    totalValue: totalValue[0]?.sum ?? 0,
+  };
+}
+
+export async function getTaskStats() {
+  const total = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(tasks);
+  const done = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(tasks)
+    .where(eq(tasks.status, "done"));
+  const overdue = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(tasks)
+    .where(and(
+      sql`${tasks.dueDate} < now()`,
+      sql`${tasks.status} != 'done'`
+    ));
+
+  return {
+    total: total[0]?.count ?? 0,
+    done: done[0]?.count ?? 0,
+    overdue: overdue[0]?.count ?? 0,
+  };
+}
+
+// ── Territories ────────────────────────────────────────
+
+export async function getTerritories() {
+  return db.query.territories.findMany();
+}
+
+// ── Contacts ───────────────────────────────────────────
+
+export type ContactWithRelations = typeof contacts.$inferSelect & {
+  organization: typeof organizations.$inferSelect | null;
+};
+
+function filtreContacts(search?: string) {
+  return search
+    ? or(
+        ilike(contacts.fullName, `%${search}%`),
+        ilike(contacts.email, `%${search}%`),
+        ilike(contacts.mobileNo, `%${search}%`)
+      )
+    : undefined;
+}
+
+// Une page à la fois : les 10 846 contacts d'un coup mettaient 91 s et figeaient Chrome.
+export async function getContacts(
+  search?: string,
+  page?: { limit: number; offset: number }
+): Promise<ContactWithRelations[]> {
+  return db.query.contacts.findMany({
+    where: filtreContacts(search),
+    with: { organization: true },
+    orderBy: [desc(contacts.createdAt)],
+    ...(page ? { limit: page.limit, offset: page.offset } : {}),
+  });
+}
+
+export async function countContacts(search?: string) {
+  const [r] = await db.select({ n: sql<number>`count(*)::int` }).from(contacts).where(filtreContacts(search));
+  return r?.n ?? 0;
+}
+
+export async function getContactById(id: string) {
+  const contact = await db.query.contacts.findFirst({
+    where: eq(contacts.id, id),
+    with: { organization: true },
+  });
+  if (!contact) return null;
+
+  const leadConditions = [];
+  if (contact.email) leadConditions.push(ilike(leads.email, contact.email));
+  if (contact.mobileNo) leadConditions.push(ilike(leads.mobileNo, contact.mobileNo));
+
+  const [contactLeads, contactDealLinks] = await Promise.all([
+    db.query.leads.findMany({
+      where: leadConditions.length > 0 ? or(...leadConditions) : undefined,
+      with: { status: true },
+      orderBy: [desc(leads.createdAt)],
+    }),
+    db.query.dealContacts.findMany({
+      where: eq(dealContacts.contactId, id),
+      with: {
+        deal: {
+          with: { status: true, organization: true },
+        },
+      },
+    }),
+  ]);
+
+  return {
+    ...contact,
+    leads: contactLeads,
+    deals: contactDealLinks.map((d) => d.deal),
+  };
+}
+
+export async function createContact(data: typeof contacts.$inferInsert) {
+  const [contact] = await db.insert(contacts).values(data).returning();
+  return contact;
+}
+
+export async function updateContact(
+  id: string,
+  data: Partial<typeof contacts.$inferInsert>
+) {
+  const [contact] = await db
+    .update(contacts)
+    .set({ ...data, updatedAt: new Date() })
+    .where(eq(contacts.id, id))
+    .returning();
+  return contact;
+}
+
+// ── Organizations ──────────────────────────────────────
+
+export type OrganizationWithRelations = typeof organizations.$inferSelect & {
+  industry: typeof industries.$inferSelect | null;
+  territory: typeof territories.$inferSelect | null;
+};
+
+export async function getOrganizations(search?: string): Promise<OrganizationWithRelations[]> {
+  return db.query.organizations.findMany({
+    where: search
+      ? or(
+          ilike(organizations.name, `%${search}%`),
+          ilike(organizations.website, `%${search}%`)
+        )
+      : undefined,
+    with: { industry: true, territory: true },
+    orderBy: [desc(organizations.createdAt)],
+  });
+}
+
+export async function getOrganizationById(id: string) {
+  const org = await db.query.organizations.findFirst({
+    where: eq(organizations.id, id),
+    with: { industry: true, territory: true },
+  });
+  if (!org) return null;
+
+  const [orgContacts, orgLeads, orgDeals] = await Promise.all([
+    db.query.contacts.findMany({
+      where: eq(contacts.organizationId, id),
+      orderBy: [desc(contacts.createdAt)],
+    }),
+    db.query.leads.findMany({
+      where: eq(leads.organizationId, id),
+      with: { status: true },
+      orderBy: [desc(leads.createdAt)],
+    }),
+    db.query.deals.findMany({
+      where: eq(deals.organizationId, id),
+      with: { status: true },
+      orderBy: [desc(deals.createdAt)],
+    }),
+  ]);
+
+  return {
+    ...org,
+    contacts: orgContacts,
+    leads: orgLeads,
+    deals: orgDeals,
+  };
+}
+
+export async function createOrganization(
+  data: typeof organizations.$inferInsert
+) {
+  const [org] = await db.insert(organizations).values(data).returning();
+  return org;
+}
+
+export async function updateOrganization(
+  id: string,
+  data: Partial<typeof organizations.$inferInsert>
+) {
+  const [org] = await db
+    .update(organizations)
+    .set({ ...data, updatedAt: new Date() })
+    .where(eq(organizations.id, id))
+    .returning();
+  return org;
+}
+
+export async function getOrCreateOrganizationByName(name: string) {
+  const existing = await db.query.organizations.findFirst({
+    where: ilike(organizations.name, name),
+  });
+  if (existing) return existing;
+  return createOrganization({ name });
+}
+
+// ── Deal Statuses ──────────────────────────────────────
+
+export async function getDealStatuses() {
+  return db.query.dealStatuses.findMany({
+    orderBy: [asc(dealStatuses.position)],
+  });
+}
+
+export async function getDefaultDealStatus() {
+  return db.query.dealStatuses.findFirst({
+    where: eq(dealStatuses.isDefault, true),
+  });
+}
+
+// ── Lost Reasons ───────────────────────────────────────
+
+export async function getLostReasons() {
+  return db.query.lostReasons.findMany();
+}
+
+// ── Deals: List ────────────────────────────────────────
+
+export type DealWithRelations = typeof deals.$inferSelect & {
+  status: typeof dealStatuses.$inferSelect | null;
+  organization: typeof organizations.$inferSelect | null;
+  lead: typeof leads.$inferSelect | null;
+  lostReason: typeof lostReasons.$inferSelect | null;
+};
+
+export async function getDeals(search?: string): Promise<DealWithRelations[]> {
+  return db.query.deals.findMany({
+    where: search
+      ? or(
+          ilike(deals.email, `%${search}%`),
+          ilike(deals.mobileNo, `%${search}%`),
+          ilike(deals.firstName, `%${search}%`),
+          ilike(deals.lastName, `%${search}%`)
+        )
+      : undefined,
+    with: {
+      status: true,
+      organization: true,
+      lead: true,
+      lostReason: true,
+    },
+    orderBy: [desc(deals.createdAt)],
+  });
+}
+
+export async function getDealsKanban() {
+  const statuses = await db.query.dealStatuses.findMany({
+    orderBy: [asc(dealStatuses.position)],
+    with: {
+      deals: {
+        orderBy: [desc(deals.createdAt)],
+        with: {
+          organization: true,
+        },
+      },
+    },
+  });
+  return statuses;
+}
+
+// ── Deals: Detail ──────────────────────────────────────
+
+export async function getDealById(id: string) {
+  const deal = await db.query.deals.findFirst({
+    where: eq(deals.id, id),
+    with: {
+      status: true,
+      organization: true,
+      lead: true,
+      source: true,
+      industry: true,
+      territory: true,
+      lostReason: true,
+      dealProducts: {
+        with: { product: true },
+      },
+    },
+  });
+  if (!deal) return null;
+
+  const [dealContactLinks, dealActivities, dealTasks, dealComments] = await Promise.all([
+    db.query.dealContacts.findMany({
+      where: eq(dealContacts.dealId, id),
+      with: { contact: { with: { organization: true } } },
+    }),
+    db.query.activities.findMany({
+      where: and(
+        eq(activities.referenceType, "deal"),
+        eq(activities.referenceId, id)
+      ),
+      orderBy: [desc(activities.createdAt)],
+    }),
+    db.query.tasks.findMany({
+      where: and(eq(tasks.referenceType, "deal"), eq(tasks.referenceId, id)),
+      orderBy: [desc(tasks.createdAt)],
+    }),
+    db.query.comments.findMany({
+      where: and(eq(comments.referenceType, "deal"), eq(comments.referenceId, id)),
+      orderBy: [desc(comments.createdAt)],
+    }),
+  ]);
+
+  return {
+    ...deal,
+    contacts: dealContactLinks.map((d) => d.contact),
+    activities: dealActivities,
+    tasks: dealTasks,
+    comments: dealComments,
+  };
+}
+
+export async function createDeal(data: typeof deals.$inferInsert) {
+  const [deal] = await db.insert(deals).values(data).returning();
+  return deal;
+}
+
+export async function updateDeal(
+  id: string,
+  data: Partial<typeof deals.$inferInsert>
+) {
+  const [deal] = await db
+    .update(deals)
+    .set({ ...data, updatedAt: new Date() })
+    .where(eq(deals.id, id))
+    .returning();
+  return deal;
+}
+
+export async function updateDealStatus(dealId: string, statusId: string) {
+  const [deal] = await db
+    .update(deals)
+    .set({ statusId, updatedAt: new Date() })
+    .where(eq(deals.id, dealId))
+    .returning();
+  return deal;
+}
+
+// ── Products ───────────────────────────────────────────
+
+// ── Notes ──────────────────────────────────────────────
+
+export async function getNotes() {
+  return db.query.notes.findMany({
+    orderBy: [desc(notes.createdAt)],
+  });
+}
+
+export async function createNote(data: typeof notes.$inferInsert) {
+  const createdBy =
+    data.createdBy !== undefined ? data.createdBy : await currentActor();
+  const [note] = await db.insert(notes).values({ ...data, createdBy }).returning();
+  return note;
+}
+
+export async function updateNote(id: string, data: Partial<typeof notes.$inferInsert>) {
+  const [note] = await db
+    .update(notes)
+    .set({ ...data, updatedAt: new Date() })
+    .where(eq(notes.id, id))
+    .returning();
+  return note;
+}
+
+// ── Tasks ──────────────────────────────────────────────
+
+export async function getTasks(assignedTo?: string) {
+  return db.query.tasks.findMany({
+    // Comparaison insensible à la casse : `assigned_to` est du texte libre
+    // (le formulaire dit « Email ou nom »), pas une clé étrangère vers un compte.
+    where: assignedTo ? ilike(tasks.assignedTo, assignedTo) : undefined,
+    orderBy: [desc(tasks.createdAt)],
+  });
+}
+
+/**
+ * La tâche de rappel d'un lead, dans la liste de celui qui a passé l'appel.
+ * UNE SEULE ouverte par personne et par lead : noter trois appels sans réponse
+ * ne doit pas empiler trois « Rappeler … » dont deux resteraient en retard pour
+ * toujours — on repousse celle qui existe déjà.
+ */
+export async function scheduleFollowUpTask(input: {
+  leadId: string;
+  leadName: string;
+  assignedTo: string;
+  dueDate: Date;
+}) {
+  const existing = await db.query.tasks.findFirst({
+    where: and(
+      eq(tasks.referenceType, "lead"),
+      eq(tasks.referenceId, input.leadId),
+      eq(tasks.assignedTo, input.assignedTo),
+      inArray(tasks.status, ["backlog", "todo", "in_progress"]),
+      ilike(tasks.title, "Rappeler %")
+    ),
+  });
+
+  if (existing) {
+    return updateTask(existing.id, { dueDate: input.dueDate });
+  }
+
+  return createTask({
+    title: `Rappeler ${input.leadName}`,
+    status: "todo",
+    dueDate: input.dueDate,
+    assignedTo: input.assignedTo,
+    referenceType: "lead",
+    referenceId: input.leadId,
+    createdBy: input.assignedTo,
+  });
+}
+
+/** Nom lisible des colonnes de pipeline, par id. */
+export async function getStatusLabels(ids: string[]) {
+  const clean = ids.filter(Boolean);
+  if (clean.length === 0) return new Map<string, string>();
+  const rows = await db.query.leadStatuses.findMany({
+    where: inArray(leadStatuses.id, clean),
+  });
+  return new Map(rows.map((r) => [r.id, r.name]));
+}
+
+export async function createTask(data: typeof tasks.$inferInsert) {
+  const [task] = await db.insert(tasks).values(data).returning();
+  return task;
+}
+
+export async function updateTask(id: string, data: Partial<typeof tasks.$inferInsert>) {
+  const [task] = await db
+    .update(tasks)
+    .set({ ...data, updatedAt: new Date() })
+    .where(eq(tasks.id, id))
+    .returning();
+  return task;
+}
+
+export async function updateTaskStatus(taskId: string, status: string) {
+  const [task] = await db
+    .update(tasks)
+    .set({ status: status as never, updatedAt: new Date() })
+    .where(eq(tasks.id, taskId))
+    .returning();
+  return task;
+}
+
+export async function deleteTask(id: string) {
+  await db.delete(tasks).where(eq(tasks.id, id));
+}
+
+// ── Email Templates ────────────────────────────────────
+
+export async function getEmailTemplates() {
+  return db.query.emailTemplates.findMany({
+    orderBy: [desc(emailTemplates.createdAt)],
+  });
+}
+
+export async function getEmailTemplateById(id: string) {
+  return db.query.emailTemplates.findFirst({
+    where: eq(emailTemplates.id, id),
+  });
+}
+
+export async function createEmailTemplate(data: typeof emailTemplates.$inferInsert) {
+  const [tpl] = await db.insert(emailTemplates).values(data).returning();
+  return tpl;
+}
+
+export async function updateEmailTemplate(id: string, data: Partial<typeof emailTemplates.$inferInsert>) {
+  const [tpl] = await db
+    .update(emailTemplates)
+    .set({ ...data, updatedAt: new Date() })
+    .where(eq(emailTemplates.id, id))
+    .returning();
+  return tpl;
+}
+
+export async function deleteEmailTemplate(id: string) {
+  await db.delete(emailTemplates).where(eq(emailTemplates.id, id));
+}
+
+// ── Comments ───────────────────────────────────────────
+
+export async function createComment(data: typeof comments.$inferInsert) {
+  // Même règle d'attribution que createActivity : un commentaire apparaît dans
+  // le fil du lead, il doit porter son auteur.
+  const createdBy =
+    data.createdBy !== undefined ? data.createdBy : await currentActor();
+  const [comment] = await db
+    .insert(comments)
+    .values({ ...data, createdBy })
+    .returning();
+  return comment;
+}
+
+// ── Call Logs ──────────────────────────────────────────
+
+export async function getCallLogs() {
+  return db.query.callLogs.findMany({
+    orderBy: [desc(callLogs.createdAt)],
+  });
+}
+
+export async function getCallLogsByReference(
+  referenceType: "lead" | "deal" | "contact" | "organization",
+  referenceId: string
+) {
+  return db.query.callLogs.findMany({
+    where: and(
+      eq(callLogs.referenceType, referenceType),
+      eq(callLogs.referenceId, referenceId)
+    ),
+    orderBy: [desc(callLogs.createdAt)],
+  });
+}
+
+export async function createCallLog(data: typeof callLogs.$inferInsert) {
+  const [log] = await db.insert(callLogs).values(data).returning();
+  return log;
+}
+
+// ── Notifications ──────────────────────────────────────
+
+export async function getNotifications(userId?: string, limit?: number) {
+  return db.query.notifications.findMany({
+    where: userId ? eq(notifications.userId, userId) : undefined,
+    orderBy: [desc(notifications.createdAt)],
+    limit,
+  });
+}
+
+export async function getUnreadNotificationCount(userId?: string) {
+  const result = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(notifications)
+    .where(
+      and(
+        eq(notifications.read, false),
+        userId ? eq(notifications.userId, userId) : sql`true`
+      )
+    );
+  return result[0]?.count ?? 0;
+}
+
+export async function createNotification(data: typeof notifications.$inferInsert) {
+  const [notif] = await db.insert(notifications).values(data).returning();
+  return notif;
+}
+
+export async function markNotificationRead(id: string) {
+  await db.update(notifications).set({ read: true }).where(eq(notifications.id, id));
+}
+
+export async function markAllNotificationsRead(userId?: string) {
+  await db
+    .update(notifications)
+    .set({ read: true })
+    .where(
+      and(
+        eq(notifications.read, false),
+        userId ? eq(notifications.userId, userId) : sql`true`
+      )
+    );
+}
+
+// ── View Settings (saved views) ────────────────────────
+
+export async function getViewSettings(routeName: string) {
+  return db.query.viewSettings.findMany({
+    where: eq(viewSettings.routeName, routeName),
+    orderBy: [asc(viewSettings.label)],
+  });
+}
+
+export async function createViewSetting(data: typeof viewSettings.$inferInsert) {
+  const [view] = await db.insert(viewSettings).values(data).returning();
+  return view;
+}
+
+export async function deleteViewSetting(id: string) {
+  await db.delete(viewSettings).where(eq(viewSettings.id, id));
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Pivot formation-centric — DAL Phase 1
+// ═══════════════════════════════════════════════════════════════
+
+// ── Bootcamps : helpers ────────────────────────────────
+
+// Sème les 2 stages système par bootcamp (promote-or-create, idempotent).
+// - converted : cherche kind='converted' ; sinon un stage dont le name matche
+//   ILIKE l'un de 'inscrit','converti','converted','enrolled','admis' → PROMEUT
+//   (kind='converted', isSystem=true). Sinon seulement → crée "Converti".
+// - lost : même logique avec 'perdu','lost','abandonné','refusé'.
+// N'insère jamais un 2e stage du même kind.
+const CONVERTED_NAME_PATTERNS = ["inscrit", "converti", "converted", "enrolled", "admis"];
+const LOST_NAME_PATTERNS = ["perdu", "lost", "abandonné", "refusé"];
+
+function matchesAny(name: string, patterns: string[]): boolean {
+  const lower = name.toLowerCase();
+  return patterns.some((p) => lower.includes(p));
+}
+
+export async function ensureSystemStages(bootcampId: string) {
+  const stages = await db.query.leadStatuses.findMany({
+    where: eq(leadStatuses.bootcampId, bootcampId),
+  });
+  const maxPos = stages.reduce((m, s) => Math.max(m, s.position), -1);
+  const updates: Promise<void>[] = [];
+  const toInsert: { name: string; color: string; position: number; isDefault: boolean; isSystem: boolean; kind: "converted" | "lost"; bootcampId: string }[] = [];
+
+  // --- converted ---
+  if (!stages.some((s) => s.kind === "converted")) {
+    const candidate = stages.find((s) => matchesAny(s.name, CONVERTED_NAME_PATTERNS));
+    if (candidate) {
+      // PROMOTE : on garde le name existant, on marque juste kind+isSystem.
+      updates.push(
+        (async () => {
+          await db.update(leadStatuses).set({ kind: "converted", isSystem: true }).where(eq(leadStatuses.id, candidate.id));
+        })()
+      );
+    } else {
+      toInsert.push({ name: "Converti", color: "purple", position: maxPos + 1, isDefault: false, isSystem: true, kind: "converted", bootcampId });
+    }
+  }
+
+  // --- lost ---
+  if (!stages.some((s) => s.kind === "lost")) {
+    const candidate = stages.find((s) => matchesAny(s.name, LOST_NAME_PATTERNS));
+    if (candidate) {
+      updates.push(
+        (async () => {
+          await db.update(leadStatuses).set({ kind: "lost", isSystem: true }).where(eq(leadStatuses.id, candidate.id));
+        })()
+      );
+    } else {
+      toInsert.push({ name: "Lost", color: "red", position: maxPos + (toInsert.length > 0 ? 2 : 1), isDefault: false, isSystem: true, kind: "lost", bootcampId });
+    }
+  }
+
+  if (updates.length > 0) await Promise.all(updates);
+  if (toInsert.length > 0) await db.insert(leadStatuses).values(toInsert);
+}
+
+// Réordonne les stages d'un bootcamp selon l'ordre des ids fourni.
+export async function reorderStages(bootcampId: string, orderedIds: string[]) {
+  await Promise.all(
+    orderedIds.map((id, idx) =>
+      db.update(leadStatuses).set({ position: idx }).where(eq(leadStatuses.id, id))
+    )
+  );
+}
+
+// ── Leads : contact (personne) + transitions ───────────
+
+// Déduplication par lower(trim(email)) puis lower(trim(mobileNo)).
+// Corrige le gap de normalisation de getOrCreateOrganizationByName (pas de trim/lower).
+export async function getOrCreateContactForLead(input: {
+  email: string | null;
+  mobileNo: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  fullName: string;
+  whatsapp?: string | null;
+  age?: number | null;
+}) {
+  // 1) par email normalisé → match sûr, réutilise
+  if (input.email && input.email.trim()) {
+    const norm = input.email.trim().toLowerCase();
+    const found = await db.query.contacts.findFirst({
+      where: sql`lower(trim(coalesce(${contacts.email}, ''))) = ${norm}`,
+    });
+    if (found) return found;
+  }
+  // 2) par mobile : ne fusionne pas automatiquement deux humains (fix P2).
+  //    Si un contact existe déjà avec ce mobile ET le même fullName → réutilise (re-soumission).
+  //    Sinon → crée un nouveau contact flagué possibleDuplicate pour révision manuelle.
+  if (input.mobileNo && input.mobileNo.trim()) {
+    // Numéro COMPLET : « +216 22… » et « 22… » sont le même
+    // numéro — la comparaison au texte près laissait passer 28 doublons.
+    const existingWithMobile = await db.query.contacts.findFirst({
+      where: sql`numero_complet(${contacts.mobileNo}) = numero_complet(${input.mobileNo}) and numero_complet(${input.mobileNo}) <> ''`,
+    });
+    if (existingWithMobile && input.fullName.trim().toLowerCase() === existingWithMobile.fullName.trim().toLowerCase()) {
+      return existingWithMobile;
+    }
+    return createContact({
+      firstName: input.firstName?.trim() || null,
+      lastName: input.lastName?.trim() || null,
+      fullName: input.fullName.trim(),
+      email: input.email?.trim() || null,
+      mobileNo: input.mobileNo?.trim() || null,
+      whatsapp: input.whatsapp?.trim() || null,
+      age: input.age ?? null,
+      possibleDuplicate: !!existingWithMobile,
+    });
+  }
+  // 3) ni email ni mobile → création simple
+  return createContact({
+    firstName: input.firstName?.trim() || null,
+    lastName: input.lastName?.trim() || null,
+    fullName: input.fullName.trim(),
+    email: input.email?.trim() || null,
+    mobileNo: input.mobileNo?.trim() || null,
+    whatsapp: input.whatsapp?.trim() || null,
+    age: input.age ?? null,
+  });
+}
+
+// Lecture légère du statusId courant (pour capturer le fromStatusId avant une transition).
+export async function getLeadStatusId(leadId: string): Promise<string | null> {
+  const lead = await db.query.leads.findFirst({
+    where: eq(leads.id, leadId),
+    columns: { statusId: true },
+  });
+  return lead?.statusId ?? null;
+}
+
+// Le type d'une colonne (normal | converted | lost…), pour les gardes des actions.
+export async function getLeadStatusKind(statusId: string): Promise<string | null> {
+  const status = await db.query.leadStatuses.findFirst({
+    where: eq(leadStatuses.id, statusId),
+    columns: { kind: true },
+  });
+  return status?.kind ?? null;
+}
+
+/**
+ * Position du lead dans SA colonne du kanban, et ses voisins — pour passer au
+ * lead précédent / suivant depuis la fiche mobile. Même ordre que le kanban
+ * (plus récent d'abord, cf. getLeadsKanban).
+ */
+export async function getColumnNeighbors(
+  leadId: string,
+  bootcampId: string,
+  statusId: string
+): Promise<{ index: number; total: number; prevId: string | null; nextId: string | null }> {
+  const rows = await db
+    .select({ id: leads.id })
+    .from(leads)
+    .where(and(eq(leads.bootcampId, bootcampId), eq(leads.statusId, statusId)))
+    .orderBy(desc(leads.createdAt));
+  const i = rows.findIndex((r) => r.id === leadId);
+  return {
+    index: i,
+    total: rows.length,
+    prevId: i > 0 ? rows[i - 1].id : null,
+    nextId: i >= 0 && i < rows.length - 1 ? rows[i + 1].id : null,
+  };
+}
+
+// Renvoie le stage kind='converted' d'un bootcamp (unique par construction P1).
+// Utilisé par enrollLeadAction pour savoir où poser un lead inscrit.
+export async function getConvertedStageForBootcamp(bootcampId: string) {
+  return db.query.leadStatuses.findFirst({
+    where: and(eq(leadStatuses.bootcampId, bootcampId), eq(leadStatuses.kind, "converted")),
+  });
+}
+
+// ── Form Sources (formulaires Elementor par bootcamp) ──
+
+export async function getFormSourcesByBootcamp(bootcampId: string) {
+  return db.query.formSources.findMany({
+    where: eq(formSources.bootcampId, bootcampId),
+    orderBy: [asc(formSources.createdAt)],
+  });
+}
+
+// ── Désignation du kind d'une colonne (unicité par bootcamp) ──
+// Au plus UNE colonne 'converted' et UNE 'lost' par bootcamp : on rétrograde
+// d'abord toute colonne du même kind (y compris la cible si elle l'était déjà),
+// puis on promeut la cible. Idempotent. Ne touche AUCUN lead (option A).
+export async function setStageKind(
+  bootcampId: string,
+  statusId: string,
+  kind: "normal" | "converted" | "lost"
+) {
+  if (kind !== "normal") {
+    await db
+      .update(leadStatuses)
+      .set({ kind: "normal", isSystem: false })
+      .where(and(eq(leadStatuses.bootcampId, bootcampId), eq(leadStatuses.kind, kind)));
+  }
+  await db
+    .update(leadStatuses)
+    .set({ kind, isSystem: kind !== "normal" })
+    .where(and(eq(leadStatuses.id, statusId), eq(leadStatuses.bootcampId, bootcampId)));
+}
+
+// Déplace un lead vers un stage : update statusId + stageEnteredAt ET insère stage_history.
+// exec = db par défaut ; passer un tx Drizzle pour exécuter dans une transaction.
+export async function moveLeadToStage(
+  leadId: string,
+  statusId: string,
+  exec: DbExecutor = db
+) {
+  const current = await exec.query.leads.findFirst({
+    where: eq(leads.id, leadId),
+    columns: { statusId: true },
+  });
+  await exec
+    .update(leads)
+    .set({ statusId, stageEnteredAt: new Date(), updatedAt: new Date() })
+    .where(eq(leads.id, leadId));
+  await exec.insert(stageHistory).values({
+    leadId,
+    fromStatusId: current?.statusId ?? null,
+    toStatusId: statusId,
+  });
+  return exec.query.leads.findFirst({ where: eq(leads.id, leadId) });
+}
+
+// ── Tags ───────────────────────────────────────────────
+
+export async function getTags() {
+  return db.query.tags.findMany({ orderBy: [asc(tags.name)] });
+}
+
+export async function getTagById(id: string) {
+  return db.query.tags.findFirst({ where: eq(tags.id, id) });
+}
+
+export async function createTag(data: typeof tags.$inferInsert) {
+  const [tag] = await db.insert(tags).values(data).returning();
+  return tag;
+}
+
+// ── Tags : un fait sur la PERSONNE, pas sur le dossier ────────────
+//
+// Les tags vivent techniquement sur les fiches (lead_tags), mais un tag dit
+// d'où vient quelqu'un et ce qu'il a fait (webinar, Alumni, Lead…) : ça ne
+// change pas d'une formation à l'autre. Décision du 2026-09-18 : un tag se
+// comporte comme un tag de personne — hérité par toute nouvelle fiche, posé
+// et retiré sur toutes ses fiches. L'état d'un dossier, lui, c'est sa colonne.
+
+/** Toutes les fiches de la personne à laquelle appartient cette fiche (elle comprise). */
+async function siblingLeadIds(leadId: string): Promise<string[]> {
+  const rows = await db.execute<{ id: string }>(sql`
+    select l.id from leads l
+    where l.id = ${leadId}
+       or l.contact_id = (select contact_id from leads where id = ${leadId} and contact_id is not null)`);
+  return [...rows].map((r) => r.id);
+}
+
+/** Pose le tag sur cette fiche ET sur les autres fiches de la même personne. */
+export async function attachTagToLead(leadId: string, tagId: string) {
+  const ids = await siblingLeadIds(leadId);
+  await db
+    .insert(leadTags)
+    .values(ids.map((id) => ({ leadId: id, tagId })))
+    .onConflictDoNothing();
+}
+
+/**
+ * Une fiche neuve hérite des tags que la personne porte déjà sur ses autres
+ * fiches — sinon un report, un second formulaire ou un message WhatsApp
+ * créent un dossier « sans tag » pour quelqu'un qu'on connaît (exemple :
+ * Alumni + webinar un mois, rien le suivant).
+ */
+export async function inheritContactTags(leadId: string, contactId: string | null) {
+  if (!contactId) return;
+  await db.execute(sql`
+    insert into lead_tags (lead_id, tag_id)
+    select distinct ${leadId}::uuid, lt.tag_id
+    from lead_tags lt join leads l on l.id = lt.lead_id
+    where l.contact_id = ${contactId} and l.id <> ${leadId}
+    on conflict do nothing`);
+}
+
+// Import CSV : un tag choisi par son nom — réutilisé s'il existe déjà (tags.name est UNIQUE).
+export async function getOrCreateTagByName(name: string) {
+  const clean = name.trim();
+  const found = await db.query.tags.findFirst({
+    where: sql`lower(${tags.name}) = ${clean.toLowerCase()}`,
+  });
+  if (found) return found;
+  return createTag({ name: clean, color: "gray" });
+}
+
+// Import CSV : compléter un lead et son contact déjà connus — remplir ce qui est vide, ne jamais écraser.
+// Un nom égal à l'email (ou à sa partie avant le @) est un nom de remplacement : il compte comme vide.
+// Réimport d'une personne connue : le mobile du fichier ÉCRASE l'ancien (décision
+// du 2026-09-18, le CSV est plus récent) ; nom, prénom et téléphone ne remplissent
+// que ce qui est vide.
+export async function completeFromImport(
+  leadId: string,
+  contactId: string,
+  f: { fullName: string | null; firstName: string | null; lastName: string | null; mobileNo: string | null; phone: string | null }
+) {
+  const placeholder = sql`(lower(${leads.fullName}) = lower(coalesce(${leads.email}, '')) or lower(${leads.fullName}) = split_part(lower(coalesce(${leads.email}, '')), '@', 1))`;
+  await db
+    .update(leads)
+    .set({
+      fullName: sql`case when ${placeholder} then coalesce(${f.fullName}, ${leads.fullName}) else ${leads.fullName} end`,
+      firstName: sql`coalesce(nullif(${leads.firstName}, ''), ${f.firstName})`,
+      mobileNo: sql`coalesce(nullif(${f.mobileNo}::text, ''), ${leads.mobileNo})`,
+      phone: sql`coalesce(nullif(${leads.phone}, ''), ${f.phone})`,
+    })
+    .where(eq(leads.id, leadId));
+  const cPlaceholder = sql`(lower(${contacts.fullName}) = lower(coalesce(${contacts.email}, '')) or lower(${contacts.fullName}) = split_part(lower(coalesce(${contacts.email}, '')), '@', 1))`;
+  await db
+    .update(contacts)
+    .set({
+      fullName: sql`case when ${cPlaceholder} then coalesce(${f.fullName}, ${contacts.fullName}) else ${contacts.fullName} end`,
+      firstName: sql`coalesce(nullif(${contacts.firstName}, ''), ${f.firstName})`,
+      lastName: sql`coalesce(nullif(${contacts.lastName}, ''), ${f.lastName})`,
+      mobileNo: sql`coalesce(nullif(${f.mobileNo}::text, ''), ${contacts.mobileNo})`,
+    })
+    .where(eq(contacts.id, contactId));
+}
+
+// Import CSV : la personne a-t-elle déjà un lead (dans n'importe quelle formation) ?
+export async function findLeadIdByContact(contactId: string): Promise<string | null> {
+  const lead = await db.query.leads.findFirst({
+    columns: { id: true },
+    where: eq(leads.contactId, contactId),
+  });
+  return lead?.id ?? null;
+}
+
+/** Retire le tag de cette fiche ET des autres fiches de la même personne. */
+export async function detachTagFromLead(leadId: string, tagId: string) {
+  const ids = await siblingLeadIds(leadId);
+  await db.delete(leadTags).where(and(inArray(leadTags.leadId, ids), eq(leadTags.tagId, tagId)));
+}
+
+// ── Payment Schedules ──────────────────────────────────
+
+const deuxChiffres = (n: number) => String(n).padStart(2, "0");
+
+/**
+ * La date de la n-ième échéance (index 0 = la première) — décision du 26/09 :
+ * la 1ʳᵉ le jour de l'inscription, puis un mois après le DÉBUT de la formation,
+ * et ainsi de suite (début le 26/10 → 26/11, 26/12). Sans date de début : le
+ * 1er de chaque mois qui suit l'inscription. Jamais dans le passé. Calculée en
+ * texte (heure locale) : new Date(y, m, 1).toISOString() reculait d'un jour
+ * sur une machine en UTC+1.
+ */
+export function dateEcheance(index: number, debutFormation: string | null, maintenant = new Date()): string {
+  const aujourdhui = maintenant.toLocaleDateString("en-CA", { timeZone: APP_TIMEZONE });
+  if (index === 0) return aujourdhui;
+  const [ay, am] = aujourdhui.split("-").map(Number);
+  const [y, m, j] = debutFormation ? debutFormation.split("-").map(Number) : [ay, am, 1];
+  const t = new Date(Date.UTC(y, m - 1 + index, 1));
+  const dernierJour = new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth() + 1, 0)).getUTCDate();
+  const d = `${t.getUTCFullYear()}-${deuxChiffres(t.getUTCMonth() + 1)}-${deuxChiffres(Math.min(j, dernierJour))}`;
+  return d < aujourdhui ? aujourdhui : d;
+}
+
+// Génère les échéances depuis l'offre prix du bootcamp du lead.
+// 'total' → 1 échéance (amount=priceTotal) ; 'monthly' → monthlyCount échéances (amount=monthlyAmount).
+// exec = db par défaut ; passer un tx Drizzle pour exécuter dans une transaction.
+/**
+ * `overrides` = montants NÉGOCIÉS pour ce lead. Absents → tarif de la formation.
+ * Ils atterrissent dans payment_schedules.amount, d'où le chiffre d'affaires est
+ * calculé (sum(amount) where is_paid) : une remise remonte donc juste dans les
+ * rapports, sans colonne supplémentaire.
+ */
+/**
+ * Refaire l'échéancier d'un lead DÉJÀ inscrit — la négociation d'après-coup.
+ *
+ * Ce qui est encaissé ne se réécrit pas : les échéances payées restent intactes,
+ * telles quelles, avec leur montant et leur date. Le chiffre d'affaires se
+ * calcule sur `sum(amount) where is_paid` — y toucher réécrirait l'histoire
+ * comptable pour rattraper une remise accordée aujourd'hui.
+ *
+ * Seules les échéances NON payées sont remplacées, et elles se partagent ce qui
+ * reste à devoir : `nouveau total − déjà encaissé`.
+ */
+export async function rescheduleLead(
+  leadId: string,
+  plan: "total" | "monthly",
+  newTotal: number,
+  monthlyCount: number
+): Promise<{ ok: true; paid: number; remaining: number } | { ok: false; error: string }> {
+  const rows = await db.query.paymentSchedules.findMany({
+    where: eq(paymentSchedules.leadId, leadId),
+  });
+  if (rows.length === 0) return { ok: false, error: "Ce lead n'a pas d'échéancier." };
+  const fiche = await db.query.leads.findFirst({ where: eq(leads.id, leadId), with: { bootcamp: { columns: { startDate: true } } } });
+  const debut = fiche?.bootcamp?.startDate ?? null;
+  const dejaPayees = rows.filter((r) => r.isPaid).length;
+
+  const paid = rows
+    .filter((r) => r.isPaid)
+    .reduce((sum, r) => sum + Number(r.amount ?? 0), 0);
+
+  const remaining = Math.round((newTotal - paid) * 100) / 100;
+  if (remaining < 0) {
+    return {
+      ok: false,
+      error: `Il a déjà versé ${paid} — un total de ${newTotal} serait inférieur à ce qu'il a payé.`,
+    };
+  }
+
+  const count = plan === "monthly" ? Math.max(1, monthlyCount) : 1;
+
+  await db.transaction(async (tx) => {
+    await tx
+      .delete(paymentSchedules)
+      .where(and(eq(paymentSchedules.leadId, leadId), eq(paymentSchedules.isPaid, false)));
+
+    if (remaining === 0) return; // Soldé : plus rien à devoir.
+
+    // Le reste se divise à l'unité près, et le dernier versement absorbe
+    // l'arrondi — sinon 700 / 3 laisserait un centime dans la nature.
+    const base = Math.floor((remaining / count) * 100) / 100;
+    const last = Math.round((remaining - base * (count - 1)) * 100) / 100;
+
+    const values = Array.from({ length: count }, (_, i) => ({
+      leadId,
+      plan,
+      amount: String(i === count - 1 ? last : base),
+      // Les échéances restantes gardent leur rang dans le calendrier : après
+      // une échéance payée, la suivante est la 2ᵉ (un mois après le début).
+      dueDate: dateEcheance(dejaPayees + i, debut),
+    }));
+    await tx.insert(paymentSchedules).values(values);
+  });
+
+  return { ok: true, paid, remaining };
+}
+
+export async function generateScheduleForLead(
+  leadId: string,
+  plan: "total" | "monthly",
+  exec: DbExecutor = db,
+  overrides?: {
+    totalAmount?: string;
+    monthlyCount?: number;
+    monthlyAmount?: string;
+    // Un montant PAR échéance (ex. 500 / 400 / 400) : la longueur fait foi sur
+    // monthlyCount, et l'absence retombe sur le montant uniforme.
+    monthlyAmounts?: string[];
+  }
+) {
+  const lead = await exec.query.leads.findFirst({
+    where: eq(leads.id, leadId),
+    with: { bootcamp: true },
+  });
+  if (!lead?.bootcamp) return [];
+  const b = lead.bootcamp;
+
+  if (plan === "total") {
+    const amount = overrides?.totalAmount ?? b.priceTotal;
+    if (!amount) return [];
+    const today = new Date();
+    await exec.insert(paymentSchedules).values({
+      leadId,
+      plan: "total",
+      amount,
+      dueDate: today.toISOString().slice(0, 10), // dû le jour J (inscription)
+    });
+  } else {
+    const perEcheance = overrides?.monthlyAmounts;
+    const count = perEcheance?.length || (overrides?.monthlyCount ?? b.monthlyCount);
+    const monthly = overrides?.monthlyAmount ?? b.monthlyAmount;
+    if (!count || (!perEcheance && !monthly)) return [];
+    const rows: { leadId: string; plan: "monthly"; amount: string; dueDate: string }[] = [];
+    for (let i = 0; i < count; i++) {
+      // Échéance 1 = acompte, le jour de l'inscription ; les suivantes, calées
+      // sur le début de la formation (cf. dateEcheance).
+      const amount = perEcheance?.[i] ?? monthly!;
+      rows.push({ leadId, plan: "monthly", amount, dueDate: dateEcheance(i, b.startDate) });
+    }
+    await exec.insert(paymentSchedules).values(rows);
+  }
+  return exec.query.paymentSchedules.findMany({
+    where: eq(paymentSchedules.leadId, leadId),
+    orderBy: [asc(paymentSchedules.createdAt)],
+  });
+}
+
+// Marque une échéance précise comme payée.
+// exec = db par défaut ; passer un tx Drizzle pour exécuter dans une transaction.
+export async function markEcheancePaid(
+  id: string,
+  exec: DbExecutor = db,
+  receivedBy?: string | null,
+  method?: string | null
+) {
+  await exec
+    .update(paymentSchedules)
+    .set({
+      isPaid: true,
+      paidAt: new Date(),
+      receivedBy: receivedBy ?? null,
+      method: method ?? null,
+    })
+    .where(eq(paymentSchedules.id, id));
+}
+
+// Marque la PREMIÈRE échéance d'un lead comme payée (utilisé par enrollLeadAction).
+// exec = db par défaut ; passer un tx Drizzle pour exécuter dans une transaction.
+export async function markFirstEcheancePaid(
+  leadId: string,
+  exec: DbExecutor = db,
+  receivedBy?: string | null,
+  method?: string | null
+): Promise<string | null> {
+  const schedules = await exec.query.paymentSchedules.findMany({
+    where: eq(paymentSchedules.leadId, leadId),
+    orderBy: [asc(paymentSchedules.createdAt)],
+  });
+  if (schedules.length === 0) return null;
+  await exec
+    .update(paymentSchedules)
+    .set({
+      isPaid: true,
+      paidAt: new Date(),
+      receivedBy: receivedBy ?? null,
+      method: method ?? null,
+    })
+    .where(eq(paymentSchedules.id, schedules[0].id));
+  // L'id remonte pour que l'appelant puisse y attacher un justificatif.
+  return schedules[0].id;
+}
+
+// Retourne l'échéancier d'un lead ordonné par dueDate + résumé.
+export async function getScheduleForLead(leadId: string) {
+  const rows = await db.query.paymentSchedules.findMany({
+    where: eq(paymentSchedules.leadId, leadId),
+    orderBy: [asc(paymentSchedules.dueDate), asc(paymentSchedules.createdAt)],
+  });
+  const count = rows.length;
+  const paidCount = rows.filter((r) => r.isPaid).length;
+  const total = rows.reduce((acc, r) => acc + (r.amount ? Number(r.amount) : 0), 0);
+  const status = await paymentStatus(leadId);
+  return { items: rows, summary: { total, paidCount, count, status } };
+}
+
+// Marque une échéance comme non payée (correction).
+export async function markEcheanceUnpaid(id: string, exec: DbExecutor = db) {
+  // `proofPath` et `proofName` sont volontairement conservés : décocher est le
+  // plus souvent une correction de clic, et on ne détruit pas une preuve de
+  // paiement pour ça. Le justificatif est reproposé au prochain pointage.
+  await exec
+    .update(paymentSchedules)
+    .set({ isPaid: false, paidAt: null, receivedBy: null, method: null })
+    .where(eq(paymentSchedules.id, id));
+}
+
+// 'paid' = toutes réglées ; 'on_track' = des non-réglées mais aucune en retard ; 'overdue' = au moins une en retard.
+export async function paymentStatus(leadId: string): Promise<"paid" | "on_track" | "overdue"> {
+  const rows = await db.query.paymentSchedules.findMany({
+    where: eq(paymentSchedules.leadId, leadId),
+  });
+  if (rows.length === 0) return "on_track";
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const allPaid = rows.every((r) => r.isPaid);
+  if (allPaid) return "paid";
+  const hasOverdue = rows.some(
+    (r) => !r.isPaid && r.dueDate != null && new Date(r.dueDate) < today
+  );
+  return hasOverdue ? "overdue" : "on_track";
+}
+
+// ── Analytics (Phase 3c) ──────────────────────────────
+
+function timeSince(date: Date): string {
+  const days = Math.floor((Date.now() - date.getTime()) / (1000 * 60 * 60 * 24));
+  if (days < 1) return "< 1 jour";
+  if (days === 1) return "1 jour";
+  return `${days} jours`;
+}
+
+function formatDuration(days: number): string {
+  if (days < 1) return "< 1 jour";
+  const d = Math.round(days * 10) / 10;
+  return `${d} j`;
+}
+
+const STALL_DAYS = 7;
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+export async function conversionStats(bootcampId?: string) {
+  const filter = bootcampId ? eq(leads.bootcampId, bootcampId) : undefined;
+
+  const allLeads = await db.query.leads.findMany({
+    where: filter,
+    columns: { converted: true, convertedAt: true, createdAt: true, stageEnteredAt: true },
+    with: { status: { columns: { kind: true } } },
+  });
+
+  const totalLeads = allLeads.length;
+  const convertedLeads = allLeads.filter((l) => l.converted && l.convertedAt);
+  const convertedCount = convertedLeads.length;
+  const conversionRate = totalLeads > 0 ? convertedCount / totalLeads : 0;
+
+  const durations = convertedLeads
+    .map((l) => {
+      const diff = l.convertedAt!.getTime() - l.createdAt.getTime();
+      return diff / (1000 * 60 * 60 * 24);
+    })
+    .filter((d) => d >= 0);
+
+  const avgDaysToConvert = durations.length > 0
+    ? durations.reduce((a, b) => a + b, 0) / durations.length
+    : null;
+  const medianDaysToConvert = durations.length > 0 ? median(durations) : null;
+
+  // Contrepoids : leads ouverts (non convertis, non perdus)
+  const now = Date.now();
+  const openLeads = allLeads.filter((l) => {
+    if (l.converted) return false;
+    return l.status?.kind !== "lost";
+  });
+  const openCount = openLeads.length;
+
+  const lostLeads = allLeads.filter((l) => l.status?.kind === "lost" && !l.converted);
+  const lostCount = lostLeads.length;
+
+  const ages = openLeads.map((l) => (now - l.createdAt.getTime()) / (1000 * 60 * 60 * 24));
+  const avgAgeOpenLeads = ages.length > 0 ? ages.reduce((a, b) => a + b, 0) / ages.length : null;
+
+  const stalledCount = openLeads.filter((l) => {
+    const ref = l.stageEnteredAt ?? l.createdAt;
+    return (now - ref.getTime()) / (1000 * 60 * 60 * 24) > STALL_DAYS;
+  }).length;
+
+  return { totalLeads, convertedCount, conversionRate, avgDaysToConvert, medianDaysToConvert, openCount, lostCount, avgAgeOpenLeads, stalledCount };
+}
+
+export async function funnelByStage(bootcampId?: string) {
+  if (bootcampId) {
+    const statuses = await db.query.leadStatuses.findMany({
+      where: eq(leadStatuses.bootcampId, bootcampId),
+      orderBy: [asc(leadStatuses.position)],
+      with: {
+        leads: { columns: { id: true } },
+      },
+    });
+
+    // Current count par stage (toujours exact — reflet du statut courant)
+    const stages = statuses.map((s) => ({
+      id: s.id,
+      name: s.name,
+      kind: s.kind,
+      position: s.position,
+      currentCount: s.leads.length,
+    }));
+
+    // Cumulés : nombre de leads ayant ATTEINT ce stage (via stage_history si dispo,
+    // sinon best-effort basé sur le stage courant)
+    const stageIds = statuses.map((s) => s.id);
+    let reachedMap = new Map<string, number>();
+
+    if (stageIds.length > 0) {
+      const rows = await db.execute<{ to_status_id: string; cnt: number }>(
+        sql`SELECT to_status_id, COUNT(DISTINCT lead_id) as cnt
+            FROM stage_history
+            WHERE to_status_id IN (${sql.join(stageIds.map((id) => sql`${id}`), sql`, `)})
+            GROUP BY to_status_id`
+      );
+      for (const r of rows) {
+        reachedMap.set(r.to_status_id, Number(r.cnt));
+      }
+    }
+
+    const stagesWithReached = stages.map((s) => ({
+      ...s,
+      reachedCount: reachedMap.get(s.id) ?? s.currentCount,
+    }));
+
+    return { type: "by_stage" as const, stages: stagesWithReached };
+  }
+
+  // Global : agrège par kind
+  const allStatuses = await db.query.leadStatuses.findMany({
+    with: { leads: { columns: { id: true } } },
+  });
+  const byKind = { new: 0, in_progress: 0, converted: 0, lost: 0 };
+  for (const s of allStatuses) {
+    if (s.kind === "converted") byKind.converted += s.leads.length;
+    else if (s.kind === "lost") byKind.lost += s.leads.length;
+    else if (s.kind === "normal" && s.position <= 1) byKind.new += s.leads.length;
+    else byKind.in_progress += s.leads.length;
+  }
+
+  return { type: "by_kind" as const, ...byKind };
+}
+
+/** Les pubs Meta « clic vers WhatsApp » : leads amenés et inscrits, par pub. */
+export async function conversionByAd() {
+  const rows = await db.execute<{ pub: string; lien: string | null; leads: number; inscrits: number; premier: string }>(sql`
+    select coalesce(nullif(l.ad_referral->>'headline', ''), 'Pub ' || (l.ad_referral->>'source_id')) as pub,
+           max(l.ad_referral->>'source_url') as lien,
+           count(*)::int as leads,
+           count(*) filter (where s.kind = 'converted' or l.converted)::int as inscrits,
+           min(l.created_at)::text as premier
+    from leads l left join lead_statuses s on s.id = l.status_id
+    where l.ad_referral is not null
+    group by l.ad_referral->>'source_id', 1
+    order by leads desc`);
+  return [...rows];
+}
+
+export async function conversionBySource(bootcampId?: string) {
+  const filter = bootcampId ? eq(leads.bootcampId, bootcampId) : undefined;
+
+  const rows = await db.query.leads.findMany({
+    where: filter,
+    columns: { converted: true, convertedAt: true },
+    with: { source: true, formSource: true },
+  });
+
+  // Grouper par formSource (si dispo) sinon lead_source, sinon "Sans source"
+  const groups = new Map<string, { total: number; converted: number }>();
+  for (const lead of rows) {
+    const key = lead.formSource?.name || lead.source?.name || "Sans source";
+    const g = groups.get(key) || { total: 0, converted: 0 };
+    g.total++;
+    if (lead.converted) g.converted++;
+    groups.set(key, g);
+  }
+
+  return Array.from(groups.entries())
+    .map(([source, { total, converted }]) => ({
+      source,
+      total,
+      converted,
+      rate: total > 0 ? converted / total : 0,
+    }))
+    .sort((a, b) => b.total - a.total);
+}
+
+export async function conversionByTemperature(bootcampId?: string) {
+  const filter = bootcampId ? eq(leads.bootcampId, bootcampId) : undefined;
+
+  const rows = await db.query.leads.findMany({
+    where: filter,
+    columns: { temperature: true, converted: true, convertedAt: true },
+  });
+
+  const hot = { total: 0, converted: 0 };
+  const cold = { total: 0, converted: 0 };
+
+  for (const lead of rows) {
+    if (lead.temperature === "hot") {
+      hot.total++;
+      if (lead.converted) hot.converted++;
+    } else {
+      cold.total++;
+      if (lead.converted) cold.converted++;
+    }
+  }
+
+  return {
+    hot: { ...hot, rate: hot.total > 0 ? hot.converted / hot.total : 0 },
+    cold: { ...cold, rate: cold.total > 0 ? cold.converted / cold.total : 0 },
+  };
+}
+
+// ── Note Templates ─────────────────────────────────────
+
+// Capture structurée d'une transition de statut.
+// exec = db par défaut ; passer un tx Drizzle pour exécuter dans une transaction.
+export async function recordStageChange(
+  leadId: string,
+  fromStatusId: string | null,
+  toStatusId: string | null,
+  changedBy?: string | null,
+  exec: DbExecutor = db
+) {
+  // Même règle que createActivity : l'import passe "webhook", tout le reste
+  // hérite du compte connecté.
+  const actor = changedBy !== undefined ? changedBy : await currentActor();
+  const [row] = await exec
+    .insert(stageHistory)
+    .values({ leadId, fromStatusId, toStatusId, changedBy: actor })
+    .returning();
+  return row;
+}
+
+// ── Connexion WordPress ────────────────────────────────
+// Table à ligne unique (id = true). Voir schema.ts.
+
+/** Credentials complets, App Password inclus. SERVEUR UNIQUEMENT. */
+export async function getWpConnection() {
+  const [row] = await db.select().from(wpConnection).limit(1);
+  return row ?? null;
+}
+
+/**
+ * Vue sûre pour l'UI : jamais l'App Password, juste s'il est renseigné.
+ * C'est cette fonction que la page settings doit appeler.
+ */
+export async function getWpConnectionPublic() {
+  const row = await getWpConnection();
+  if (!row) return null;
+  const { appPassword, ...rest } = row;
+  return { ...rest, hasPassword: appPassword.length > 0 };
+}
+
+/**
+ * Upsert de la ligne unique. `appPassword` omis/vide = on garde celui en place
+ * (l'UI n'affiche jamais le mot de passe, elle ne peut donc pas le renvoyer).
+ */
+export async function saveWpConnection(data: {
+  siteUrl: string;
+  username: string;
+  appPassword?: string;
+}) {
+  const existing = await getWpConnection();
+  const appPassword = data.appPassword || existing?.appPassword;
+  if (!appPassword) throw new Error("App Password requis");
+
+  const [row] = await db
+    .insert(wpConnection)
+    .values({
+      id: true,
+      siteUrl: data.siteUrl,
+      username: data.username,
+      appPassword,
+      updatedAt: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: wpConnection.id,
+      set: {
+        siteUrl: data.siteUrl,
+        username: data.username,
+        appPassword,
+        updatedAt: new Date(),
+      },
+    })
+    .returning();
+  return row;
+}
+
+export async function recordWpConnectionTest(ok: boolean, message: string) {
+  await db
+    .update(wpConnection)
+    .set({ lastTestedAt: new Date(), lastTestOk: ok, lastTestMessage: message })
+    .where(eq(wpConnection.id, true));
+}
+
+// ── Lien formation ↔ formulaire Elementor ──────────────
+// Un formulaire n'alimente qu'UNE formation : garanti par l'index unique
+// partiel `form_sources_elementor_form_active_key` (migration 0009).
+
+/** Formulaires déjà pris, avec le nom de la formation qui les détient. */
+export async function getLinkedElementorForms() {
+  const rows = await db
+    .select({
+      sourceId: formSources.id,
+      elementorFormId: formSources.elementorFormId,
+      bootcampId: formSources.bootcampId,
+      bootcampName: bootcamps.name,
+    })
+    .from(formSources)
+    .leftJoin(bootcamps, eq(formSources.bootcampId, bootcamps.id))
+    .where(and(eq(formSources.active, true), sql`${formSources.elementorFormId} is not null`));
+  return rows;
+}
+
+/**
+ * Dernier mapping non vide déjà saisi pour ce formulaire Elementor, toutes
+ * formations confondues. Délier/relier crée une NOUVELLE ligne form_sources :
+ * sans ça, le mapping fait à la main est silencieusement reperdu (vécu le
+ * 18/08/2026 — 85 leads importés sans téléphone pendant 10 jours).
+ */
+export async function getLastMappingForElementorForm(
+  elementorFormId: string
+): Promise<Record<string, string> | null> {
+  const rows = await db.query.formSources.findMany({
+    where: eq(formSources.elementorFormId, elementorFormId),
+    orderBy: [desc(formSources.createdAt)],
+  });
+  for (const row of rows) {
+    const m = (row.fieldMapping ?? {}) as Record<string, string>;
+    if (Object.values(m).some((v) => v)) return m;
+  }
+  return null;
+}
+
+export async function linkElementorForm(args: {
+  bootcampId: string;
+  elementorFormId: string;
+  name: string;
+  lastSubmissionId: number | null;
+  fieldMapping?: Record<string, string>;
+  lastPayload?: Record<string, string> | null;
+}) {
+  // Colonne d'arrivée = 1re colonne normale du pipeline de la formation.
+  const normalStages = await db.query.leadStatuses.findMany({
+    where: and(
+      eq(leadStatuses.bootcampId, args.bootcampId),
+      eq(leadStatuses.kind, "normal")
+    ),
+    orderBy: [asc(leadStatuses.position)],
+  });
+
+  const [row] = await db
+    .insert(formSources)
+    .values({
+      bootcampId: args.bootcampId,
+      name: args.name,
+      elementorFormId: args.elementorFormId,
+      lastSubmissionId: args.lastSubmissionId,
+      targetStatusId: normalStages[0]?.id ?? null,
+      webhookToken: crypto.randomUUID(), // non utilisé en pull, mais la colonne est NOT NULL
+      fieldMapping: args.fieldMapping ?? {},
+      lastPayload: args.lastPayload ?? null,
+      active: true,
+    })
+    .returning();
+  return row;
+}
+
+/** Déliaison = soft (active=false) → libère le formulaire pour une autre formation. */
+export async function unlinkElementorForm(sourceId: string) {
+  await db
+    .update(formSources)
+    .set({ active: false })
+    .where(eq(formSources.id, sourceId));
+}
+
+/** Toutes les sources Elementor actives (pour le cron d'import). */
+export async function getActiveElementorSources() {
+  // Une formation archivée ne doit plus recevoir de leads : sinon l'import
+  // continuerait de remplir en silence un pipeline que plus personne ne regarde.
+  const rows = await db
+    .select({ source: formSources })
+    .from(formSources)
+    .innerJoin(bootcamps, eq(bootcamps.id, formSources.bootcampId))
+    .where(
+      and(
+        eq(formSources.active, true),
+        sql`${formSources.elementorFormId} is not null`,
+        sql`${bootcamps.archivedAt} is null`
+      )
+    );
+  return rows.map((r) => r.source);
+}
+
+export async function setFieldMapping(sourceId: string, fieldMapping: Record<string, string>) {
+  await db.update(formSources).set({ fieldMapping }).where(eq(formSources.id, sourceId));
+}
+
+/** Routage d'une source : colonne d'arrivée + tags posés sur chaque lead importé. */
+export async function setFormSourceRouting(
+  sourceId: string,
+  targetStatusId: string | null,
+  defaultTagIds: string[]
+) {
+  await db
+    .update(formSources)
+    .set({ targetStatusId, defaultTagIds })
+    .where(eq(formSources.id, sourceId));
+}
+
+// ── Tags : gestion complète ────────────────────────────
+
+/** Tags + nombre de leads qui les portent (pour l'écran de gestion). */
+export async function getTagsWithUsage() {
+  const rows = await db
+    .select({
+      id: tags.id,
+      name: tags.name,
+      color: tags.color,
+      leadCount: sql<number>`count(${leadTags.leadId})::int`,
+    })
+    .from(tags)
+    .leftJoin(leadTags, eq(leadTags.tagId, tags.id))
+    .groupBy(tags.id, tags.name, tags.color)
+    .orderBy(asc(tags.name));
+  return rows;
+}
+
+export async function updateTag(id: string, data: { name?: string; color?: string }) {
+  const [row] = await db.update(tags).set(data).where(eq(tags.id, id)).returning();
+  return row;
+}
+
+/** Supprime le tag ; `lead_tags` part en cascade (ON DELETE CASCADE au schéma). */
+export async function deleteTag(id: string) {
+  await db.delete(tags).where(eq(tags.id, id));
+}
+
+/** Ids des tags portés par un lead. */
+export async function getTagIdsForLead(leadId: string) {
+  const rows = await db
+    .select({ tagId: leadTags.tagId })
+    .from(leadTags)
+    .where(eq(leadTags.leadId, leadId));
+  return rows.map((r) => r.tagId);
+}
+
+/** Toutes les sources, actives ou non — utilisé au nettoyage d'un tag supprimé. */
+export async function getAllFormSources() {
+  return db.query.formSources.findMany();
+}
+
+export async function setFormSourceTagIds(sourceId: string, tagIds: string[]) {
+  await db.update(formSources).set({ defaultTagIds: tagIds }).where(eq(formSources.id, sourceId));
+}
+
+/** Marque un lead comme vu (1ʳᵉ ouverture de sa fiche). Idempotent. */
+export async function markLeadSeen(leadId: string) {
+  await db
+    .update(leads)
+    .set({ seenAt: new Date() })
+    .where(and(eq(leads.id, leadId), sql`${leads.seenAt} is null`));
+}
+
+/** Archive / désarchive une formation. */
+export async function setBootcampArchived(id: string, archived: boolean) {
+  await db
+    .update(bootcamps)
+    .set({ archivedAt: archived ? new Date() : null, updatedAt: new Date() })
+    .where(eq(bootcamps.id, id));
+}
+
+/**
+ * Propage sur le CONTACT l'email modifié depuis une fiche lead.
+ *
+ * Sans ça, `leads.email` affiche la nouvelle adresse pendant que les
+ * campagnes continuent de partir vers l'ancienne — celle du contact —
+ * indéfiniment et sans que rien ne le signale.
+ *
+ * Deux cas, parce qu'un contact peut porter plusieurs leads :
+ *  - un seul lead  → on met à jour le contact, c'est bien la même personne ;
+ *  - plusieurs     → on RATTACHE ce lead à un autre contact (existant ou
+ *    nouveau). Écraser l'email du contact partagé changerait l'adresse des
+ *    autres inscriptions, donc d'autres personnes.
+ */
+export async function syncLeadEmailToContact(
+  leadId: string,
+  email: string | null
+): Promise<{ action: "none" | "updated" | "reattached"; contactId: string | null }> {
+  const lead = await db.query.leads.findFirst({
+    where: eq(leads.id, leadId),
+    columns: { id: true, contactId: true, fullName: true, firstName: true, lastName: true, mobileNo: true },
+  });
+  if (!lead?.contactId) return { action: "none", contactId: null };
+
+  const clean = email?.trim() || null;
+  if (!clean) return { action: "none", contactId: lead.contactId };
+
+  const [{ n }] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(leads)
+    .where(eq(leads.contactId, lead.contactId));
+
+  if (n <= 1) {
+    // Le rebond appartient à l'ADRESSE, pas à la personne : changer d'adresse
+    // doit l'effacer, sinon la nouvelle hérite du rejet de l'ancienne et reste
+    // exclue des campagnes à tort.
+    await updateContact(lead.contactId, {
+      email: clean,
+      bouncedAt: null,
+      bounceReason: null,
+    });
+    return { action: "updated", contactId: lead.contactId };
+  }
+
+  // Contact partagé : ce lead part sur son propre contact.
+  const target = await getOrCreateContactForLead({
+    email: clean,
+    mobileNo: lead.mobileNo,
+    firstName: lead.firstName,
+    lastName: lead.lastName,
+    fullName: lead.fullName,
+  });
+  await db.update(leads).set({ contactId: target.id }).where(eq(leads.id, leadId));
+  return { action: "reattached", contactId: target.id };
+}
+
+// ── Allowed emails (collaborateurs autorisés à créer un compte) ─
+
+export type TeamMember = {
+  id: string;
+  email: string;
+  note: string | null;
+  createdAt: Date;
+  /** Un compte existe-t-il vraiment ? Autorisé ≠ inscrit. */
+  active: boolean;
+  lastSignInAt: Date | null;
+  /** Droits par membre (migration 0168). */
+  role: string;
+  permissions: Record<string, string>;
+};
+
+/**
+ * Les invités, et lesquels sont réellement entrés.
+ *
+ * `allowed_emails` dit qui a le DROIT de créer un compte ; `auth.users` dit qui
+ * l'a fait. Les confondre a coûté une heure de recherche le 2026-09-09 : une
+ * adresse invitée depuis dix jours attendait un email de réinitialisation qui
+ * ne pouvait pas partir, faute de compte à réinitialiser.
+ */
+export async function getAllowedEmails(): Promise<TeamMember[]> {
+  const rows = await db.execute<{
+    id: string;
+    email: string;
+    note: string | null;
+    created_at: Date;
+    last_sign_in_at: Date | null;
+    active: boolean;
+    role: string;
+    permissions: Record<string, string>;
+  }>(sql`
+    select a.id, a.email, a.note, a.created_at, a.role, a.permissions,
+           u.last_sign_in_at,
+           (u.id is not null) as active
+    from allowed_emails a
+    left join auth.users u on lower(u.email) = lower(a.email)
+    order by a.created_at desc
+  `);
+
+  return rows.map((r) => ({
+    id: r.id,
+    email: r.email,
+    note: r.note,
+    createdAt: r.created_at,
+    active: r.active,
+    lastSignInAt: r.last_sign_in_at,
+    role: r.role,
+    permissions: r.permissions ?? {},
+  }));
+}
+
+/**
+ * Les comptes qui existent SANS figurer dans la liste d'équipe.
+ *
+ * L'allowlist ne garde que la porte de l'INSCRIPTION : un compte créé avant
+ * elle, ou dont l'adresse a été retirée depuis, continue de se connecter
+ * normalement. Sans cette requête, l'écran Équipe répondait à « qui ai-je
+ * invité » en laissant croire qu'il répondait à « qui peut entrer ».
+ * Cas vécu : un ancien compte avait accès et n'apparaissait nulle part.
+ */
+export async function getAccountsOutsideAllowlist(): Promise<
+  { email: string; lastSignInAt: Date | null; createdAt: Date }[]
+> {
+  const rows = await db.execute<{
+    email: string;
+    last_sign_in_at: Date | null;
+    created_at: Date;
+  }>(sql`
+    select u.email, u.last_sign_in_at, u.created_at
+    from auth.users u
+    left join allowed_emails a on lower(a.email) = lower(u.email)
+    where a.id is null and u.email is not null
+      -- Un compte bloqué (retiré de l'équipe) n'a plus accès : ne pas le compter.
+      and (u.banned_until is null or u.banned_until < now())
+    order by u.created_at
+  `);
+  return rows.map((r) => ({
+    email: r.email,
+    lastSignInAt: r.last_sign_in_at,
+    createdAt: r.created_at,
+  }));
+}
+
+export async function getAllowedEmailByAddress(email: string) {
+  return db.query.allowedEmails.findFirst({
+    where: eq(allowedEmails.email, email),
+  });
+}
+
+export async function createAllowedEmail(data: typeof allowedEmails.$inferInsert) {
+  const [row] = await db.insert(allowedEmails).values(data).returning();
+  return row;
+}
+
+export async function deleteAllowedEmail(id: string) {
+  const [row] = await db.delete(allowedEmails).where(eq(allowedEmails.id, id)).returning();
+  return row ?? null;
+}
+
+export async function updateAllowedEmailPermissions(id: string, permissions: Record<string, string>) {
+  await db.update(allowedEmails).set({ permissions }).where(eq(allowedEmails.id, id));
+}
+
+export async function getAllowedEmailById(id: string) {
+  return db.query.allowedEmails.findFirst({ where: eq(allowedEmails.id, id) });
+}
+
+// ── Habillage des emails ───────────────────────────────
+
+/** Ligne unique. Absente = habillage vide (ni logo ni pied de page). */
+export async function getEmailBranding() {
+  const row = await db.query.emailBranding.findFirst();
+  return row ?? null;
+}
+
+export async function saveEmailBranding(
+  data: Omit<typeof emailBranding.$inferInsert, "id" | "updatedAt">
+) {
+  const existing = await db.query.emailBranding.findFirst();
+  if (existing) {
+    await db
+      .update(emailBranding)
+      .set({ ...data, updatedAt: new Date() })
+      .where(eq(emailBranding.id, true));
+    return;
+  }
+  await db.insert(emailBranding).values({ id: true, ...data });
+}
+
+// ── Lecture IA des leads ───────────────────────────────
+
+/** Leads d'une formation encore jamais analysés, les plus récents d'abord. */
+export async function getLeadsToAnalyze(bootcampId: string, limit: number) {
+  return db.query.leads.findMany({
+    where: and(
+      eq(leads.bootcampId, bootcampId),
+      sql`not exists (select 1 from lead_insights li where li.lead_id = ${leads.id})`
+    ),
+    orderBy: [desc(leads.createdAt)],
+    limit,
+    with: { bootcamp: true, contact: true },
+  });
+}
+
+export async function countLeadsToAnalyze(bootcampId: string) {
+  const [row] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(leads)
+    .where(
+      and(
+        eq(leads.bootcampId, bootcampId),
+        sql`not exists (select 1 from lead_insights li where li.lead_id = ${leads.id})`
+      )
+    );
+  return row?.n ?? 0;
+}
+
+/** Insights de tous les leads d'une formation, indexés par leadId. */
+export async function getInsightsByBootcamp(bootcampId: string) {
+  const rows = await db
+    .select({
+      leadId: leadInsights.leadId,
+      summary: leadInsights.summary,
+      intent: leadInsights.intent,
+      objection: leadInsights.objection,
+      // Pour le badge 🔥/❄️ de la carte, quand la proposition diffère de l'actuelle.
+      suggestedTemperature: leadInsights.suggestedTemperature,
+      temperatureProof: leadInsights.temperatureProof,
+    })
+    .from(leadInsights)
+    .innerJoin(leads, eq(leads.id, leadInsights.leadId))
+    .where(eq(leads.bootcampId, bootcampId));
+  return new Map(rows.map((r) => [r.leadId, r]));
+}
+
+// ── File d'appels du jour ──────────────────────────────
+
+export type QueueLead = {
+  id: string;
+  fullName: string | null;
+  mobileNo: string | null;
+  email: string | null;
+  bootcampName: string;
+  statusName: string;
+  stageDays: number;
+  seen: boolean;
+  intendedPlan: string | null;
+  intent: string | null;
+  summary: string | null;
+  objection: string | null;
+  lastCallAt: Date | null;
+  lastCallStatus: string | null;
+  qualification: string | null;
+  nextFollowUpAt: Date | null;
+  /** Température proposée par la lecture IA quand elle diffère de l'actuelle, avec sa preuve. */
+  proposedTemperature: { value: "hot" | "cold"; proof: string | null } | null;
+  /** A rempli plusieurs formulaires de la formation (brochure PUIS inscription). */
+  multiForm: boolean;
+  score: number;
+  reasons: string[];
+};
+
+/**
+ * Qui rappeler, et dans quel ordre.
+ *
+ * Le score est volontairement une FORMULE LISIBLE, pas un modèle : chaque lead
+ * affiche les raisons de sa place. Un tri qu'on ne peut pas expliquer ne sera
+ * pas suivi.
+ */
+export async function getCallQueue(limit = 40): Promise<QueueLead[]> {
+  const rows = await db.execute<{
+    id: string;
+    full_name: string | null;
+    mobile_no: string | null;
+    email: string | null;
+    bootcamp_id: string;
+    bootcamp_name: string;
+    status_name: string;
+    stage_days: number;
+    seen: boolean;
+    intended_plan: string | null;
+    intent: string | null;
+    summary: string | null;
+    objection: string | null;
+    last_call_at: Date | null;
+    last_call_status: string | null;
+    qualification: string | null;
+    next_follow_up_at: Date | null;
+    temperature: "hot" | "cold";
+    suggested_temperature: "hot" | "cold" | null;
+    temperature_proof: string | null;
+    a_ouvert: boolean;
+    a_clique: boolean;
+    a_vu_video: boolean;
+  }>(sql`
+    select l.id, l.full_name, l.mobile_no, l.email,
+           b.id as bootcamp_id, b.name as bootcamp_name, ls.name as status_name,
+           extract(epoch from (now() - coalesce(l.stage_entered_at, l.created_at)))/86400 as stage_days,
+           (l.seen_at is not null) as seen,
+           l.intended_plan::text as intended_plan,
+           li.intent::text as intent, li.summary, li.objection,
+           l.temperature::text as temperature,
+           li.suggested_temperature::text as suggested_temperature, li.temperature_proof,
+           l.qualification::text as qualification, l.next_follow_up_at,
+           c.created_at as last_call_at, c.status::text as last_call_status,
+           coalesce(eng.opened, false) as a_ouvert,
+           coalesce(eng.clicked, false) as a_clique,
+           coalesce(eng.video, false) as a_vu_video
+    from leads l
+    join bootcamps b
+      on b.id = l.bootcamp_id
+     and b.archived_at is null
+     -- Une formation TERMINÉE ou ANNULÉE ne se rappelle plus : filtrer sur
+     -- l'archivage seul laissait 84 leads d'août dans une file de 186.
+     and b.status not in ('completed', 'cancelled')
+    join lead_statuses ls on ls.id = l.status_id and ls.kind = 'normal'
+    left join lead_insights li on li.lead_id = l.id
+    left join lateral (
+      select cl.created_at, cl.status
+      from call_logs cl
+      where cl.reference_type = 'lead' and cl.reference_id = l.id
+      order by cl.created_at desc limit 1
+    ) c on true
+    left join lateral (
+      select bool_or(ar.opened_at is not null) as opened,
+             bool_or(ar.clicked_at is not null) as clicked,
+             bool_or(exists (
+               select 1 from automation_link_clicks alc
+               where alc.run_id = ar.id and alc.url ilike '%youtu%'
+             )) as video
+      from automation_runs ar
+      where ar.lead_id = l.id
+    ) eng on true
+    where l.mobile_no is not null
+  `);
+
+  // Une seule passe par formation, pas une par lead.
+  const multi = new Set<string>();
+  for (const bid of new Set(rows.map((r) => r.bootcamp_id))) {
+    for (const id of await getMultiFormByBootcamp(bid)) multi.add(id);
+  }
+
+  const scored = rows.map((r) => {
+    const reasons: string[] = [];
+    let score = 0;
+
+    // La qualification d'un humain prime sur la lecture d'un modèle : elle
+    // vient de la conversation, pas d'un formulaire.
+    const QUALIF: Record<string, { pts: number; label: string }> = {
+      chaud: { pts: 40, label: "🔥 chaud" },
+      tiede: { pts: 15, label: "tiède" },
+      froid: { pts: -25, label: "froid" },
+      pas_serieux: { pts: -70, label: "pas sérieux" },
+      hors_cible: { pts: -100, label: "hors cible" },
+      reporte: { pts: -40, label: "reporté à une prochaine session" },
+    };
+    if (r.qualification && QUALIF[r.qualification]) {
+      score += QUALIF[r.qualification].pts;
+      reasons.push(QUALIF[r.qualification].label);
+    }
+
+    // Un rappel programmé fait autorité : avant la date on n'appelle pas,
+    // le jour venu il passe devant tout le reste.
+    if (r.next_follow_up_at) {
+      const due = new Date(r.next_follow_up_at).getTime();
+      if (due <= Date.now()) { score += 60; reasons.unshift("rappel prévu"); }
+      else { score -= 80; reasons.push("rappel programmé plus tard"); }
+    }
+
+    if (r.intent === "serieux") { score += 50; reasons.push("profil sérieux"); }
+    else if (r.intent === "curieux") { score += 25; reasons.push("curieux"); }
+    else if (r.intent === "hors_cible") { score -= 100; reasons.push("hors cible"); }
+    else if (r.intent) { score += 5; }
+
+    if (!r.last_call_at) { score += 30; reasons.push("jamais appelé"); }
+
+    // Rappeler quelqu'un le lendemain d'un appel est contre-productif.
+    const daysSinceCall = r.last_call_at
+      ? (Date.now() - new Date(r.last_call_at).getTime()) / 86400000
+      : null;
+    if (daysSinceCall !== null && daysSinceCall < 3) {
+      score -= 60;
+      reasons.push("appelé récemment");
+    } else if (r.last_call_status === "no_answer") {
+      score += 20;
+      reasons.push("n'avait pas répondu");
+    }
+
+    const days = Math.round(Number(r.stage_days) || 0);
+    score += Math.min(days, 20);
+    if (days >= 5) reasons.push(`${days} j sans bouger`);
+
+    if (r.intended_plan) { score += 10; reasons.push("a choisi une formule"); }
+
+    // Le signal le plus fort : a téléchargé le programme PUIS rempli
+    // l'inscription en connaissant le prix.
+    const multiForm = multi.has(r.id);
+    if (multiForm) { score += 45; reasons.unshift("brochure puis inscription"); }
+
+    // Ce qu'il a fait de l'email. Le clic est un acte volontaire : il pèse.
+    // L'ouverture ne vaut presque rien — Apple et Gmail préchargent l'image de
+    // suivi et comptent des ouvertures que personne n'a faites. La compter zéro
+    // serait faux aussi, d'où un poids délibérément faible.
+    if (r.a_clique) {
+      score += 40;
+      reasons.unshift(r.a_vu_video ? "a cliqué la vidéo" : "a cliqué dans l'email");
+    } else if (r.a_ouvert) {
+      score += 8;
+      reasons.push("a ouvert l'email");
+    }
+    if (!r.seen) { score += 5; }
+
+    // La température PROPOSÉE par la lecture IA (fil WhatsApp compris), quand
+    // elle contredit l'actuelle. Poids modéré : c'est une lecture, pas une
+    // qualification humaine — celle-ci reste au-dessus.
+    const proposee =
+      r.suggested_temperature && r.suggested_temperature !== r.temperature
+        ? { value: r.suggested_temperature, proof: r.temperature_proof }
+        : null;
+    if (proposee?.value === "hot") { score += 30; reasons.unshift("🔥 proposé chaud"); }
+    else if (proposee?.value === "cold") { score -= 15; reasons.push("❄️ proposé froid"); }
+
+    return {
+      id: r.id,
+      fullName: r.full_name,
+      mobileNo: r.mobile_no,
+      email: r.email,
+      bootcampName: r.bootcamp_name,
+      statusName: r.status_name,
+      stageDays: days,
+      seen: r.seen,
+      intendedPlan: r.intended_plan,
+      intent: r.intent,
+      summary: r.summary,
+      objection: r.objection,
+      lastCallAt: r.last_call_at,
+      lastCallStatus: r.last_call_status,
+      qualification: r.qualification,
+      nextFollowUpAt: r.next_follow_up_at,
+      proposedTemperature: proposee,
+      multiForm,
+      score,
+      reasons,
+    };
+  });
+
+  return scored.sort((a, b) => b.score - a.score).slice(0, limit);
+}
+
+// ── Contacts déjà venus sur une autre formation ────────
+
+export type ReturningInfo = {
+  /** Autres formations où ce contact apparaît. */
+  formations: string[];
+  /** Il s'est déjà INSCRIT ailleurs : ancien élève, signal fort. */
+  alumni: boolean;
+};
+
+/**
+ * Qui, parmi les leads de cette formation, est déjà passé par une autre.
+ *
+ * Le rapprochement se fait par `contact_id` — donc par email dédupliqué. Une
+ * personne revenue avec une AUTRE adresse ne sera pas reconnue : c'est la
+ * limite du procédé, pas un oubli.
+ */
+export async function getReturningByBootcamp(
+  bootcampId: string
+): Promise<Map<string, ReturningInfo>> {
+  const rows = await db.execute<{
+    lead_id: string;
+    formations: string[];
+    alumni: boolean;
+  }>(sql`
+    select l.id as lead_id,
+           to_jsonb(array_agg(distinct ob.name)) as formations,
+           bool_or(o.converted) as alumni
+    from leads l
+    join leads o
+      on o.contact_id = l.contact_id
+     and o.id <> l.id
+     and o.bootcamp_id <> l.bootcamp_id
+    join bootcamps ob on ob.id = o.bootcamp_id
+    where l.bootcamp_id = ${bootcampId} and l.contact_id is not null
+    group by l.id
+  `);
+
+  return new Map(
+    rows.map((r) => [
+      r.lead_id,
+      { formations: r.formations ?? [], alumni: !!r.alumni },
+    ])
+  );
+}
+
+/** Même information pour UN lead, pour la fiche. */
+export async function getReturningForLead(leadId: string): Promise<ReturningInfo | null> {
+  const rows = await db.execute<{ formations: string[]; alumni: boolean }>(sql`
+    select to_jsonb(array_agg(distinct ob.name)) as formations, bool_or(o.converted) as alumni
+    from leads l
+    join leads o
+      on o.contact_id = l.contact_id
+     and o.id <> l.id
+     and o.bootcamp_id <> l.bootcamp_id
+    join bootcamps ob on ob.id = o.bootcamp_id
+    where l.id = ${leadId} and l.contact_id is not null
+  `);
+  const r = rows[0];
+  if (!r?.formations?.length) return null;
+  return { formations: r.formations, alumni: !!r.alumni };
+}
+
+// ── Double parcours : brochure PUIS inscription ────────
+
+/**
+ * Qui a rempli PLUSIEURS formulaires de la formation.
+ *
+ * Signal commercial le plus fort dont on dispose : télécharger le programme,
+ * puis revenir remplir l'inscription en ayant vu le prix.
+ *
+ * ⚠️ Les clés sont dérivées des `field_mapping` réels des sources, jamais
+ * écrites en dur : un formulaire remanié ferait mentir une liste figée.
+ *
+ * ⚠️ Un lead qui commence par la brochure et s'inscrit ensuite est FUSIONNÉ
+ * dans la fiche existante SANS changer de colonne — il reste donc en
+ * « Nouveau ». C'est précisément pour ça que ce marqueur existe.
+ */
+// ── Chronologie complète d'un lead ─────────────────────
+
+export type TimelineEvent = {
+  at: Date;
+  /** Famille d'événement — décide de la pastille à l'écran. */
+  kind: "form" | "stage" | "call" | "email" | "whatsapp" | "engagement" | "payment" | "note";
+  label: string;
+  detail?: string | null;
+  /** Qui l'a fait. Null = le lead lui-même ou la machine. */
+  actor?: string | null;
+};
+
+/**
+ * Tout ce qui est arrivé à ce lead, dans l'ordre, à la minute près.
+ *
+ * Sept sources fusionnées en mémoire plutôt qu'en SQL : chacune a ses colonnes
+ * de date et son vocabulaire, et une union SQL les aurait forcées dans un
+ * moule commun illisible. Le volume par lead est de quelques dizaines de
+ * lignes — le tri se fait ici sans coût.
+ */
+export async function getLeadTimeline(leadId: string): Promise<TimelineEvent[]> {
+  const out: TimelineEvent[] = [];
+
+  // 1. L'arrivée : quel formulaire, et quand.
+  const [lead] = await db
+    .select({
+      createdAt: leads.createdAt,
+      sourceName: formSources.name,
+      wantsCall: leads.wantsCall,
+      promoCode: leads.promoCode,
+      intendedPlan: leads.intendedPlan,
+    })
+    .from(leads)
+    .leftJoin(formSources, eq(formSources.id, leads.formSourceId))
+    .where(eq(leads.id, leadId))
+    .limit(1);
+
+  if (lead) {
+    const bits: string[] = [];
+    if (lead.intendedPlan)
+      bits.push(lead.intendedPlan === "total" ? "paiement comptant" : "paiement en plusieurs fois");
+    if (lead.promoCode) bits.push(`code « ${lead.promoCode} »`);
+    if (lead.wantsCall) bits.push("a demandé à être rappelé");
+    out.push({
+      at: lead.createdAt,
+      kind: "form",
+      label: lead.sourceName ? `A rempli « ${lead.sourceName} »` : "Arrivé dans le CRM",
+      detail: bits.join(" · ") || null,
+    });
+  }
+
+  // 2. Les changements de colonne.
+  const from = alias(leadStatuses, "from_status");
+  const to = alias(leadStatuses, "to_status");
+  const moves = await db
+    .select({
+      at: stageHistory.changedAt,
+      fromName: from.name,
+      toName: to.name,
+      by: stageHistory.changedBy,
+    })
+    .from(stageHistory)
+    .leftJoin(from, eq(from.id, stageHistory.fromStatusId))
+    .leftJoin(to, eq(to.id, stageHistory.toStatusId))
+    .where(eq(stageHistory.leadId, leadId));
+  for (const m of moves) {
+    out.push({
+      at: m.at,
+      kind: "stage",
+      label: m.fromName ? `${m.fromName} → ${m.toName ?? "?"}` : `Placé dans « ${m.toName ?? "?"} »`,
+      actor: m.by,
+    });
+  }
+
+  // 3. Les appels.
+  const calls = await db
+    .select({
+      at: callLogs.createdAt,
+      status: callLogs.status,
+      duration: callLogs.duration,
+      by: callLogs.callerId,
+    })
+    .from(callLogs)
+    .where(and(eq(callLogs.referenceType, "lead"), eq(callLogs.referenceId, leadId)));
+  const CALL_LABEL: Record<string, string> = {
+    completed: "Appel abouti",
+    no_answer: "Appel sans réponse",
+    busy: "Occupé",
+    failed: "Appel échoué",
+    initiated: "Appel lancé",
+  };
+  for (const c of calls) {
+    const min = c.duration ? Math.round(c.duration / 60) : 0;
+    out.push({
+      at: c.at,
+      kind: "call",
+      label: CALL_LABEL[c.status] ?? `Appel — ${c.status}`,
+      detail: min > 0 ? `${min} min` : null,
+      actor: c.by,
+    });
+  }
+
+  // 4. Les emails d'automatisation, et ce qu'il en a fait.
+  const runs = await db
+    .select({
+      id: automationRuns.id,
+      status: automationRuns.status,
+      reason: automationRuns.reason,
+      sentAt: automationRuns.sentAt,
+      createdAt: automationRuns.createdAt,
+      deliveredAt: automationRuns.deliveredAt,
+      openedAt: automationRuns.openedAt,
+      openCount: automationRuns.openCount,
+      clickedAt: automationRuns.clickedAt,
+      templateName: emailTemplates.name,
+    })
+    .from(automationRuns)
+    .innerJoin(automations, eq(automations.id, automationRuns.automationId))
+    .innerJoin(emailTemplates, eq(emailTemplates.id, automations.emailTemplateId))
+    .where(eq(automationRuns.leadId, leadId));
+
+  for (const r of runs) {
+    if (r.status === "sent" && r.sentAt) {
+      out.push({
+        at: r.sentAt,
+        kind: "email",
+        label: `Email automatique envoyé — « ${r.templateName} »`,
+      });
+    } else if (r.status !== "sent") {
+      out.push({
+        at: r.createdAt,
+        kind: "email",
+        label: `Email automatique non envoyé — « ${r.templateName} »`,
+        detail: r.reason,
+      });
+    }
+    if (r.deliveredAt)
+      out.push({ at: r.deliveredAt, kind: "email", label: "Email arrivé dans sa boîte" });
+    if (r.openedAt)
+      out.push({
+        at: r.openedAt,
+        kind: "engagement",
+        label: "A ouvert l'email",
+        // Dit sur place pourquoi ce chiffre ne vaut pas grand-chose.
+        detail:
+          r.openCount > 1
+            ? `${r.openCount} ouvertures comptées — les clients mail en inventent`
+            : "chiffre peu fiable : les clients mail préchargent l'image",
+      });
+    if (r.clickedAt) out.push({ at: r.clickedAt, kind: "engagement", label: "A CLIQUÉ dans l'email" });
+  }
+
+  // 5. Sur quel lien exactement.
+  const clicks = await db
+    .select({ at: automationLinkClicks.clickedAt, url: automationLinkClicks.url })
+    .from(automationLinkClicks)
+    .innerJoin(automationRuns, eq(automationRuns.id, automationLinkClicks.runId))
+    .where(eq(automationRuns.leadId, leadId));
+  for (const c of clicks) {
+    out.push({
+      at: c.at,
+      kind: "engagement",
+      label: /youtu/i.test(c.url) ? "A ouvert la vidéo" : "A ouvert un lien",
+      detail: c.url.replace(/^https?:\/\//, ""),
+    });
+  }
+
+  // 6. Les emails 1-à-1 et autres échanges déjà journalisés.
+  const acts = await db
+    .select({
+      at: activities.createdAt,
+      type: activities.type,
+      subject: activities.subject,
+      by: activities.createdBy,
+    })
+    .from(activities)
+    .where(and(eq(activities.referenceType, "lead"), eq(activities.referenceId, leadId)));
+  const ACT_LABEL: Record<string, string> = {
+    email: "Email envoyé à la main",
+    whatsapp: "Message WhatsApp",
+    sms: "SMS",
+    call: "Appel journalisé",
+    note: "Note",
+  };
+  for (const a of acts) {
+    // L'envoi automatique est déjà couvert par `automation_runs`, en plus riche.
+    if (a.by === "automation") continue;
+    // L'arrivée par formulaire est déjà l'événement n°1, en mieux nommé.
+    if (a.type === "webhook_in") continue;
+    const base = ACT_LABEL[String(a.type)] ?? String(a.type);
+    const kind: TimelineEvent["kind"] =
+      a.type === "call" ? "call" : a.type === "whatsapp" ? "whatsapp" : a.type === "note" || a.type === "comment" ? "note" : "email";
+    out.push({
+      at: a.at,
+      kind,
+      label: a.subject ? `${base} — « ${a.subject} »` : base,
+      actor: a.by,
+    });
+  }
+
+  // 6 bis. Les commentaires de l'équipe (table à part, ils n'étaient jamais dans la chronologie).
+  const coms = await db
+    .select({ at: comments.createdAt, content: comments.content, by: comments.createdBy })
+    .from(comments)
+    .where(and(eq(comments.referenceType, "lead"), eq(comments.referenceId, leadId)));
+  for (const c of coms) {
+    out.push({ at: c.at, kind: "note", label: "Commentaire", detail: c.content, actor: c.by });
+  }
+
+  // 7. Les paiements réellement encaissés.
+  const paid = await db
+    .select({ at: paymentSchedules.paidAt, amount: paymentSchedules.amount })
+    .from(paymentSchedules)
+    .where(and(eq(paymentSchedules.leadId, leadId), eq(paymentSchedules.isPaid, true)));
+  for (const p of paid) {
+    if (!p.at) continue;
+    out.push({ at: p.at, kind: "payment", label: "Paiement encaissé", detail: `${p.amount ?? "?"} TND` });
+  }
+
+  return out.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+}
+
+/** Ce qu'un lead a fait de l'email qu'il a reçu. */
+export type Engagement = { opened: boolean; clicked: boolean; video: boolean };
+
+/**
+ * Qui a réagi à un email d'automatisation, sur cette formation.
+ *
+ * Le CLIC est un fait ; l'ouverture, un indice faible — Apple et Gmail
+ * préchargent l'image de suivi et gonflent le compte. Les deux sont rendus
+ * séparément pour que l'appelant leur donne le poids qu'il veut.
+ */
+/** L'engagement d'UN lead — même définition que la version par formation. */
+export async function getEngagementForLead(leadId: string): Promise<Engagement | null> {
+  const rows = await db.execute<{ opened: boolean; clicked: boolean; video: boolean }>(sql`
+    select bool_or(ar.opened_at is not null) as opened,
+           bool_or(ar.clicked_at is not null) as clicked,
+           bool_or(exists (
+             select 1 from automation_link_clicks alc
+             where alc.run_id = ar.id and alc.url ilike '%youtu%'
+           )) as video
+    from automation_runs ar
+    where ar.lead_id = ${leadId}
+  `);
+  const r = rows[0];
+  if (!r || (!r.opened && !r.clicked)) return null;
+  return { opened: r.opened, clicked: r.clicked, video: r.video };
+}
+
+/** La lecture IA d'un lead, recommandation comprise. */
+export async function getInsightForLead(leadId: string) {
+  const [row] = await db
+    .select({
+      summary: leadInsights.summary,
+      intent: leadInsights.intent,
+      objection: leadInsights.objection,
+      recommendation: leadInsights.recommendation,
+      suggestedTemperature: leadInsights.suggestedTemperature,
+      temperatureProof: leadInsights.temperatureProof,
+      nextAction: leadInsights.nextAction,
+      waSignals: leadInsights.waSignals,
+      createdAt: leadInsights.createdAt,
+    })
+    .from(leadInsights)
+    .where(eq(leadInsights.leadId, leadId))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function getEngagedByBootcamp(
+  bootcampId: string
+): Promise<Map<string, Engagement>> {
+  const rows = await db.execute<{
+    lead_id: string;
+    opened: boolean;
+    clicked: boolean;
+    video: boolean;
+  }>(sql`
+    select ar.lead_id,
+           bool_or(ar.opened_at is not null) as opened,
+           bool_or(ar.clicked_at is not null) as clicked,
+           bool_or(exists (
+             select 1 from automation_link_clicks alc
+             where alc.run_id = ar.id and alc.url ilike '%youtu%'
+           )) as video
+    from automation_runs ar
+    join leads l on l.id = ar.lead_id
+    where l.bootcamp_id = ${bootcampId}
+    group by ar.lead_id
+  `);
+
+  const out = new Map<string, Engagement>();
+  for (const r of rows) {
+    if (!r.opened && !r.clicked) continue;
+    out.set(r.lead_id, { opened: r.opened, clicked: r.clicked, video: r.video });
+  }
+  return out;
+}
+
+export async function getMultiFormByBootcamp(
+  bootcampId: string,
+  /** Restreint le scan à UN lead. Une fiche n'a pas besoin des 191 autres. */
+  onlyLeadId?: string
+): Promise<Set<string>> {
+  const sources = await db.query.formSources.findMany({
+    where: and(eq(formSources.bootcampId, bootcampId), eq(formSources.active, true)),
+  });
+  if (sources.length < 2) return new Set();
+
+  const keySets = sources.map(
+    (s) => new Set(Object.keys((s.fieldMapping ?? {}) as Record<string, string>))
+  );
+  // Une clé partagée (email, name…) ne distingue rien : on garde les signatures.
+  const shared = new Set<string>();
+  for (let i = 0; i < keySets.length; i++) {
+    for (let j = i + 1; j < keySets.length; j++) {
+      for (const k of keySets[i]) if (keySets[j].has(k)) shared.add(k);
+    }
+  }
+  const signatures = keySets.map((set) => [...set].filter((k) => !shared.has(k)));
+  if (signatures.some((sig) => sig.length === 0)) return new Set();
+
+  const rows = await db.execute<{ id: string; keys: string[] }>(sql`
+    select l.id, to_jsonb(array_agg(distinct k)) as keys
+    from leads l,
+         lateral jsonb_each(l.raw_payload) as blocks(bk, bv),
+         lateral jsonb_object_keys(bv) as k
+    where l.bootcamp_id = ${bootcampId}
+      and l.raw_payload is not null
+      and jsonb_typeof(bv) = 'object'
+      ${onlyLeadId ? sql`and l.id = ${onlyLeadId}` : sql``}
+    group by l.id
+  `);
+
+  const out = new Set<string>();
+  for (const r of rows) {
+    const keys = new Set(r.keys ?? []);
+    // Présent dans TOUTES les signatures = a rempli tous les formulaires.
+    if (signatures.every((sig) => sig.some((k) => keys.has(k)))) out.add(r.id);
+  }
+  return out;
+}
+
+// ── Report vers la formation suivante ──────────────────
+
+export type CarryCandidate = {
+  id: string;
+  fullName: string | null;
+  email: string | null;
+  qualification: string | null;
+  calls: number;
+  alreadyThere: boolean;
+};
+
+/**
+ * Leads NON CONCLUS d'une formation : ni inscrits, ni perdus.
+ *
+ * Ce sont eux qu'on oublie quand la session suivante s'ouvre — alors que
+ * beaucoup ne pouvaient pas payer CE mois-là, pas jamais.
+ *
+ * `alreadyThere` = un lead existe déjà pour cette personne dans la formation
+ * cible ; on ne le reportera pas deux fois.
+ */
+export async function getCarryCandidates(
+  fromBootcampId: string,
+  toBootcampId: string
+): Promise<CarryCandidate[]> {
+  const rows = await db.execute<{
+    id: string;
+    full_name: string | null;
+    email: string | null;
+    qualification: string | null;
+    calls: number;
+    already_there: boolean;
+  }>(sql`
+    select l.id, l.full_name, l.email, l.qualification::text as qualification,
+           (select count(*)::int from call_logs cl
+             where cl.reference_type = 'lead' and cl.reference_id = l.id) as calls,
+           exists (
+             select 1 from leads t
+             where t.bootcamp_id = ${toBootcampId}
+               and lower(trim(coalesce(t.email, ''))) = lower(trim(coalesce(l.email, '')))
+               and coalesce(l.email, '') <> ''
+           ) as already_there
+    from leads l
+    join lead_statuses ls on ls.id = l.status_id
+    where l.bootcamp_id = ${fromBootcampId}
+      and ls.kind = 'normal'
+      -- Inutile de traîner ceux qu'on a déjà écartés au téléphone.
+      and (l.qualification is null or l.qualification not in ('hors_cible', 'pas_serieux'))
+    order by l.qualification nulls last, l.created_at desc
+  `);
+
+  return rows.map((r) => ({
+    id: r.id,
+    fullName: r.full_name,
+    email: r.email,
+    qualification: r.qualification,
+    calls: r.calls,
+    alreadyThere: r.already_there,
+  }));
+}
+
+/**
+ * Recrée les leads dans la formation cible.
+ *
+ * L'historique n'est PAS recopié : le nouveau lead pointe vers l'ancien
+ * (`carriedFromLeadId`) et reçoit une activité de synthèse. Recopier des
+ * appels et des notes créerait deux vérités qui divergeraient.
+ */
+export async function carryLeadsOver(
+  leadIds: string[],
+  toBootcampId: string,
+  actor: string | null,
+  // Colonne d'arrivée choisie (envoi depuis la fiche) ; sinon la 1ʳᵉ colonne.
+  toStatusId?: string
+): Promise<string[]> {
+  if (leadIds.length === 0) return [];
+
+  const stages = await db.query.leadStatuses.findMany({
+    where: and(eq(leadStatuses.bootcampId, toBootcampId), eq(leadStatuses.kind, "normal")),
+    orderBy: [asc(leadStatuses.position)],
+  });
+  const targetStatusId = toStatusId
+    ? stages.find((s) => s.id === toStatusId)?.id ?? null
+    : stages[0]?.id ?? null;
+  if (!targetStatusId) return [];
+
+  const created: string[] = [];
+  for (const leadId of leadIds) {
+    const src = await db.query.leads.findFirst({
+      where: eq(leads.id, leadId),
+      with: { bootcamp: true },
+    });
+    if (!src) continue;
+
+    const emailNorm = src.email?.trim().toLowerCase() ?? "";
+    if (emailNorm) {
+      const existing = await db.query.leads.findMany({
+        where: and(
+          eq(leads.bootcampId, toBootcampId),
+          sql`lower(trim(coalesce(${leads.email}, ''))) = ${emailNorm}`
+        ),
+        limit: 1,
+      });
+      if (existing.length > 0) continue; // déjà présent : on ne double pas
+    }
+
+    const [copy] = await db
+      .insert(leads)
+      .values({
+        bootcampId: toBootcampId,
+        contactId: src.contactId,
+        statusId: targetStatusId,
+        temperature: src.temperature,
+        fullName: src.fullName,
+        firstName: src.firstName,
+        lastName: src.lastName,
+        email: src.email,
+        mobileNo: src.mobileNo,
+        phone: src.phone,
+        jobTitle: src.jobTitle,
+        organizationName: src.organizationName,
+        motivation: src.motivation,
+        wantsCall: src.wantsCall,
+        promoCode: src.promoCode,
+        promoCodeId: src.promoCodeId,
+        // La qualification humaine suit la personne, elle ne dépend pas
+        // de la session ; l'offre, si : les prix peuvent changer.
+        qualification: src.qualification,
+        qualifiedAt: src.qualifiedAt,
+        carriedFromLeadId: src.id,
+        stageEnteredAt: new Date(),
+      })
+      .returning();
+    // Les tags suivent la personne : la fiche reportée les garde.
+    await inheritContactTags(copy.id, copy.contactId);
+
+    const calls = await db.execute<{ n: number }>(sql`
+      select count(*)::int as n from call_logs
+      where reference_type = 'lead' and reference_id = ${src.id}`);
+
+    await createActivity({
+      referenceType: "lead",
+      referenceId: copy.id,
+      type: "note",
+      direction: "outbound",
+      subject: `Reporté de « ${src.bootcamp?.name ?? "une formation précédente"} »`,
+      content: [
+        `Cette personne était déjà un lead sur ${src.bootcamp?.name ?? "une session précédente"} sans conclure.`,
+        src.qualification ? `Dernière qualification : ${src.qualification}.` : null,
+        `${calls[0]?.n ?? 0} appel(s) enregistré(s) sur la fiche d'origine.`,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      createdBy: actor,
+    });
+
+    // La fiche d'origine sort du jeu : plus d'envoi programmé depuis ses
+    // anciennes colonnes (sa colonne, elle, ne change pas : ni perdue, ni inscrite).
+    const vers = await db.query.bootcamps.findFirst({
+      where: eq(bootcamps.id, toBootcampId),
+      columns: { name: true },
+    });
+    await db
+      .update(automationRuns)
+      .set({ status: "cancelled", reason: `Reporté vers « ${vers?.name ?? "une autre formation"} »` })
+      .where(and(eq(automationRuns.leadId, src.id), eq(automationRuns.status, "pending")));
+
+    created.push(copy.id);
+  }
+  return created;
+}
+
+/** Formations pouvant recevoir un report : ouvertes, non archivées. */
+export async function getOpenBootcamps(excludeId?: string) {
+  const rows = await db.query.bootcamps.findMany({
+    where: sql`${bootcamps.archivedAt} is null and ${bootcamps.status} not in ('completed', 'cancelled')`,
+    orderBy: [desc(bootcamps.createdAt)],
+  });
+  return rows.filter((b) => b.id !== excludeId);
+}
+
+/** Fiche créée par le report de ce lead, pour le badge « Reporté → … ». */
+export async function getCarriedTo(leadId: string) {
+  const rows = await db.execute<{ lead_id: string; bootcamp_name: string }>(sql`
+    select c.id as lead_id, cb.name as bootcamp_name
+    from leads c
+    join bootcamps cb on cb.id = c.bootcamp_id
+    where c.carried_from_lead_id = ${leadId}
+    order by c.created_at desc
+    limit 1
+  `);
+  return rows[0] ?? null;
+}
+
+/** Les colonnes où l'on peut envoyer un lead, par formation ouverte. */
+export async function getCarryTargets(excludeBootcampId: string) {
+  const ouvertes = await getOpenBootcamps(excludeBootcampId);
+  if (ouvertes.length === 0) return [];
+  const colonnes = await db.query.leadStatuses.findMany({
+    where: and(
+      inArray(leadStatuses.bootcampId, ouvertes.map((b) => b.id)),
+      eq(leadStatuses.kind, "normal")
+    ),
+    orderBy: [asc(leadStatuses.position)],
+    columns: { id: true, name: true, bootcampId: true },
+  });
+  return ouvertes.map((b) => ({
+    id: b.id,
+    name: b.name,
+    columns: colonnes.filter((c) => c.bootcampId === b.id).map((c) => ({ id: c.id, name: c.name })),
+  }));
+}
+
+/**
+ * Duplique une formation pour la session suivante.
+ *
+ * Copié : l'offre, les colonnes (ordre, couleurs, types), les automatisations
+ * et les tags de colonne, rebranchés sur les NOUVELLES colonnes. Déplacés : les
+ * formulaires actifs (un formulaire n'alimente qu'une formation) — leur jeton
+ * ne change pas, rien à toucher sur le site. Aucun lead ne bouge.
+ */
+export async function duplicateBootcamp(
+  sourceId: string,
+  data: { name: string; slug: string; startDate: string | null; endDate: string | null },
+  actor: string | null
+) {
+  return db.transaction(async (tx) => {
+    const src = await tx.query.bootcamps.findFirst({ where: eq(bootcamps.id, sourceId) });
+    if (!src) throw new Error("Formation introuvable.");
+
+    const [copie] = await tx
+      .insert(bootcamps)
+      .values({
+        name: data.name,
+        slug: data.slug,
+        description: src.description,
+        startDate: data.startDate,
+        endDate: data.endDate,
+        status: "open",
+        capacity: src.capacity,
+        priceTotal: src.priceTotal,
+        currency: src.currency,
+        monthlyCount: src.monthlyCount,
+        monthlyAmount: src.monthlyAmount,
+      })
+      .returning();
+
+    // Colonnes : ancienne id → nouvelle id, pour tout rebrancher.
+    const colonnes = await tx.query.leadStatuses.findMany({
+      where: eq(leadStatuses.bootcampId, sourceId),
+      orderBy: [asc(leadStatuses.position)],
+    });
+    const nouvelle = new Map<string, string>();
+    for (const c of colonnes) {
+      const [n] = await tx
+        .insert(leadStatuses)
+        .values({
+          name: c.name,
+          color: c.color,
+          position: c.position,
+          isDefault: c.isDefault,
+          bootcampId: copie.id,
+          isSystem: c.isSystem,
+          kind: c.kind,
+        })
+        .returning({ id: leadStatuses.id });
+      nouvelle.set(c.id, n.id);
+    }
+
+    const regles = await tx.query.automations.findMany({ where: eq(automations.bootcampId, sourceId) });
+    for (const r of regles) {
+      const statusId = nouvelle.get(r.statusId);
+      if (!statusId) continue;
+      await tx.insert(automations).values({
+        bootcampId: copie.id,
+        statusId,
+        channel: r.channel,
+        emailTemplateId: r.emailTemplateId,
+        whatsappTemplate: r.whatsappTemplate,
+        whatsappLanguage: r.whatsappLanguage,
+        whatsappVariables: r.whatsappVariables,
+        delayMinutes: r.delayMinutes,
+        delayDays: r.delayDays,
+        atHour: r.atHour,
+        active: r.active,
+        pausedReason: r.pausedReason,
+        createdBy: actor,
+      });
+    }
+
+    const tagsDeColonne = await tx
+      .select()
+      .from(stageTags)
+      .where(inArray(stageTags.statusId, colonnes.map((c) => c.id)));
+    for (const t of tagsDeColonne) {
+      const statusId = nouvelle.get(t.statusId);
+      if (!statusId) continue;
+      await tx.insert(stageTags).values({ statusId, tagId: t.tagId, active: t.active, createdBy: actor });
+    }
+
+    // Les formulaires suivent la nouvelle session, chacun vers la même colonne.
+    const formulaires = await tx.query.formSources.findMany({
+      where: and(eq(formSources.bootcampId, sourceId), eq(formSources.active, true)),
+    });
+    for (const f of formulaires) {
+      await tx
+        .update(formSources)
+        .set({
+          bootcampId: copie.id,
+          targetStatusId: f.targetStatusId ? nouvelle.get(f.targetStatusId) ?? null : null,
+        })
+        .where(eq(formSources.id, f.id));
+    }
+
+    return {
+      bootcamp: copie,
+      colonnes: colonnes.length,
+      automatisations: regles.length,
+      formulaires: formulaires.length,
+      // Pour signaler les valeurs écrites à la main, recopiées telles quelles.
+      regles: regles.map((r) => ({
+        colonne: colonnes.find((c) => c.id === r.statusId)?.name ?? "?",
+        modele: r.whatsappTemplate,
+        variables: Array.isArray(r.whatsappVariables) ? (r.whatsappVariables as string[]) : [],
+      })),
+    };
+  });
+}
+
+/** Fiche d'origine d'un lead reporté, pour l'afficher et y renvoyer. */
+export async function getCarriedOrigin(leadId: string) {
+  const rows = await db.execute<{
+    origin_id: string;
+    bootcamp_name: string;
+    qualification: string | null;
+  }>(sql`
+    select o.id as origin_id, ob.name as bootcamp_name,
+           o.qualification::text as qualification
+    from leads l
+    join leads o on o.id = l.carried_from_lead_id
+    join bootcamps ob on ob.id = o.bootcamp_id
+    where l.id = ${leadId}
+  `);
+  return rows[0] ?? null;
+}
+
+// ── Tag posé à l'entrée dans une colonne ───────────────
+
+/** Les règles de tag de la formation, indexées par colonne. */
+export async function getStageTagsByBootcamp(bootcampId: string) {
+  return db
+    .select({
+      id: stageTags.id,
+      statusId: stageTags.statusId,
+      tagId: stageTags.tagId,
+      active: stageTags.active,
+      tagName: tags.name,
+      tagColor: tags.color,
+    })
+    .from(stageTags)
+    .innerJoin(tags, eq(tags.id, stageTags.tagId))
+    .innerJoin(leadStatuses, eq(leadStatuses.id, stageTags.statusId))
+    .where(eq(leadStatuses.bootcampId, bootcampId));
+}
+
+/** Pose ou remplace la règle d'une colonne. L'unicité est garantie en base. */
+export async function upsertStageTag(statusId: string, tagId: string, by: string | null) {
+  const [row] = await db
+    .insert(stageTags)
+    .values({ statusId, tagId, createdBy: by })
+    .onConflictDoUpdate({
+      target: stageTags.statusId,
+      set: { tagId, active: true },
+    })
+    .returning();
+  return row;
+}
+
+export async function deleteStageTag(statusId: string) {
+  await db.delete(stageTags).where(eq(stageTags.statusId, statusId));
+}
+
+// ── Automatisations de colonne ─────────────────────────
+// « Un lead entre dans cette colonne » → il reçoit un modèle d'email.
+// Une colonne porte AU PLUS une règle (index unique sur status_id, 0120).
+
+export async function getAutomationsByBootcamp(bootcampId: string) {
+  // ⚠️ leftJoin et non innerJoin : une règle WhatsApp n'a pas de modèle
+  // d'email, et une jointure interne la ferait disparaître de l'écran — la
+  // règle continuerait d'envoyer sans que personne puisse la voir ni l'arrêter.
+  return db
+    .select({
+      id: automations.id,
+      statusId: automations.statusId,
+      channel: automations.channel,
+      emailTemplateId: automations.emailTemplateId,
+      whatsappTemplate: automations.whatsappTemplate,
+      whatsappLanguage: automations.whatsappLanguage,
+      whatsappVariables: automations.whatsappVariables,
+      delayMinutes: automations.delayMinutes,
+      delayDays: automations.delayDays,
+      atHour: automations.atHour,
+      active: automations.active,
+      pausedReason: automations.pausedReason,
+      templateName: emailTemplates.name,
+      templateSubject: emailTemplates.subject,
+    })
+    .from(automations)
+    .leftJoin(emailTemplates, eq(emailTemplates.id, automations.emailTemplateId))
+    .where(eq(automations.bootcampId, bootcampId))
+    .orderBy(asc(automations.createdAt));
+}
+
+export async function createAutomation(data: typeof automations.$inferInsert) {
+  const [row] = await db.insert(automations).values(data).returning();
+  return row;
+}
+
+export async function updateAutomation(
+  id: string,
+  data: Partial<typeof automations.$inferInsert>
+) {
+  const [row] = await db
+    .update(automations)
+    .set(data)
+    .where(eq(automations.id, id))
+    .returning();
+  return row;
+}
+
+export async function deleteAutomation(id: string) {
+  await db.delete(automations).where(eq(automations.id, id));
+}
+
+/**
+ * Journal d'une règle : ce qui est parti, ce qui a été ignoré et POURQUOI.
+ * Sans le motif, un envoi reporté sur le plafond quotidien serait
+ * indiscernable d'un envoi jamais déclenché.
+ */
+/**
+ * Ce que l'automatisation a produit : partis, délivrés, ouverts, cliqués.
+ *
+ * ⚠️ Le nombre d'OUVERTURES est structurellement gonflé — Apple et Gmail
+ * préchargent l'image de suivi. Le CLIC, lui, ne ment pas : c'est la seule
+ * de ces mesures sur laquelle décider quelque chose.
+ */
+export async function getAutomationStats(automationId: string) {
+  const [row] = await db
+    .select({
+      envoyes: sql<number>`count(*) filter (where ${automationRuns.status} = 'sent')::int`,
+      delivres: sql<number>`count(*) filter (where ${automationRuns.deliveredAt} is not null)::int`,
+      ouverts: sql<number>`count(*) filter (where ${automationRuns.openedAt} is not null)::int`,
+      ouvertures: sql<number>`coalesce(sum(${automationRuns.openCount}), 0)::int`,
+      cliques: sql<number>`count(*) filter (where ${automationRuns.clickedAt} is not null)::int`,
+      clics: sql<number>`coalesce(sum(${automationRuns.clickCount}), 0)::int`,
+      ignores: sql<number>`count(*) filter (where ${automationRuns.status} = 'skipped')::int`,
+      echecs: sql<number>`count(*) filter (where ${automationRuns.status} = 'failed')::int`,
+    })
+    .from(automationRuns)
+    .where(eq(automationRuns.automationId, automationId));
+
+  const liens = await db
+    .select({
+      url: automationLinkClicks.url,
+      clics: sql<number>`count(*)::int`,
+    })
+    .from(automationLinkClicks)
+    .where(eq(automationLinkClicks.automationId, automationId))
+    .groupBy(automationLinkClicks.url)
+    .orderBy(sql`count(*) desc`);
+
+  return {
+    ...(row ?? {
+      envoyes: 0, delivres: 0, ouverts: 0, ouvertures: 0,
+      cliques: 0, clics: 0, ignores: 0, echecs: 0,
+    }),
+    liens,
+  };
+}
+
+export async function getAutomationRuns(automationId: string, limit = 20) {
+  return db
+    .select({
+      id: automationRuns.id,
+      status: automationRuns.status,
+      reason: automationRuns.reason,
+      scheduledAt: automationRuns.scheduledAt,
+      sentAt: automationRuns.sentAt,
+      createdAt: automationRuns.createdAt,
+      leadId: automationRuns.leadId,
+      leadName: leads.fullName,
+      leadEmail: leads.email,
+    })
+    .from(automationRuns)
+    .innerJoin(leads, eq(leads.id, automationRuns.leadId))
+    .where(eq(automationRuns.automationId, automationId))
+    .orderBy(desc(automationRuns.createdAt))
+    .limit(limit);
+}
+
+// ── Historique de la pipeline ──────────────────────────
+// « Qu'est-ce qui a été fait, et par qui ». Même idée que getLeadTimeline, mais
+// pour TOUS les leads à la fois — donc la fusion se fait en SQL et non en
+// mémoire : c'est la base qui trie et qui pagine.
+//
+// Six sources, choisies pour ne PAS se recouvrir :
+//   stage_history   les déplacements (429 lignes — plus complet que le type
+//                   `status_change` d'activities, qui n'en garde que 79)
+//   call_logs       les appels, avec leur durée
+//   activities      seulement 'email', 'note' et 'webhook_in' : 'call' et
+//                   'status_change' feraient doublon avec les deux ci-dessus
+//   comments        les commentaires
+//   tasks           les tâches créées
+//   payment_schedules  les encaissements
+
+export type HistoryKind =
+  | "stage" | "call" | "email" | "note" | "arrival" | "comment" | "task" | "payment";
+
+export type HistoryEvent = {
+  at: Date;
+  kind: HistoryKind;
+  actor: string | null;
+  leadId: string | null;
+  leadName: string | null;
+  bootcampName: string | null;
+  a: string | null;
+  b: string | null;
+  num: number | null;
+};
+
+export type HistoryFilters = {
+  actors?: string[];        // adresses brutes ; vide = tout le monde
+  kinds?: HistoryKind[];    // vide = tous les types
+  bootcampId?: string;
+  sinceDays?: number;
+  limit?: number;
+  offset?: number;
+};
+
+export async function getPipelineHistory(f: HistoryFilters = {}): Promise<HistoryEvent[]> {
+  const limit = Math.min(f.limit ?? 60, 200);
+  const offset = Math.max(f.offset ?? 0, 0);
+
+  // Les filtres s'appliquent APRÈS la fusion : écrits dans chaque branche, il
+  // faudrait les répéter six fois et une omission passerait inaperçue.
+  const conds = [sql`true`];
+  // `sql.join` et pas un tableau brut : Drizzle n'expanse pas une liste tout
+  // seul, et un `in` mal formé passerait le typage pour échouer à l'exécution.
+  if (f.actors?.length) {
+    conds.push(sql`e.actor in (${sql.join(f.actors.map((a) => sql`${a}`), sql`, `)})`);
+  }
+  if (f.kinds?.length) {
+    conds.push(sql`e.kind in (${sql.join(f.kinds.map((k) => sql`${k}`), sql`, `)})`);
+  }
+  if (f.bootcampId) conds.push(sql`l.bootcamp_id = ${f.bootcampId}`);
+  if (f.sinceDays) conds.push(sql`e.at > now() - ${`${f.sinceDays} days`}::interval`);
+
+  const rows = await db.execute<{
+    at: Date; kind: HistoryKind; actor: string | null;
+    lead_id: string | null; lead_name: string | null; bootcamp_name: string | null;
+    a: string | null; b: string | null; num: number | null;
+  }>(sql`
+    with e as (
+      select sh.changed_at as at, 'stage' as kind, sh.changed_by as actor, sh.lead_id,
+             f.name as a, t.name as b, null::numeric as num
+        from stage_history sh
+        left join lead_statuses f on f.id = sh.from_status_id
+        left join lead_statuses t on t.id = sh.to_status_id
+
+      union all
+      -- Le cast ::text est obligatoire : call_logs.status et
+      -- activities.direction sont des enums, et Postgres refuse d'unir un
+      -- enum avec du texte. (Pas de backtick ici : on est dans un gabarit JS.)
+      select c.created_at, 'call', c.caller_id, c.reference_id,
+             c.status::text, null, c.duration::numeric
+        from call_logs c where c.reference_type = 'lead'
+
+      union all
+      select a.created_at,
+             case a.type when 'webhook_in' then 'arrival' when 'note' then 'note' else 'email' end,
+             a.created_by, a.reference_id, a.subject, a.direction::text, null
+        from activities a
+       where a.reference_type = 'lead' and a.type in ('email', 'note', 'webhook_in')
+
+      union all
+      select cm.created_at, 'comment', cm.created_by, cm.reference_id,
+             left(cm.content, 140), null, null
+        from comments cm where cm.reference_type = 'lead'
+
+      union all
+      select tk.created_at, 'task', tk.created_by, tk.reference_id,
+             tk.title, tk.assigned_to, null
+        from tasks tk where tk.reference_type = 'lead'
+
+      union all
+      select ps.paid_at, 'payment', ps.received_by, ps.lead_id,
+             ps.method, ps.proof_path, ps.amount
+        from payment_schedules ps where ps.is_paid and ps.paid_at is not null
+    )
+    select e.at, e.kind, e.actor, e.lead_id,
+           l.full_name as lead_name, b.name as bootcamp_name,
+           e.a, e.b, e.num
+      from e
+      left join leads l on l.id = e.lead_id
+      left join bootcamps b on b.id = l.bootcamp_id
+     where ${sql.join(conds, sql` and `)}
+     order by e.at desc
+     limit ${limit} offset ${offset}
+  `);
+
+  return rows.map((r) => ({
+    at: r.at,
+    kind: r.kind,
+    actor: r.actor,
+    leadId: r.lead_id,
+    leadName: r.lead_name,
+    bootcampName: r.bootcamp_name,
+    a: r.a,
+    b: r.b,
+    num: r.num === null ? null : Number(r.num),
+  }));
+}
+
+/**
+ * Combien d'actions par personne, pour la barre de filtres.
+ * Le compte suit exactement le même périmètre que le fil : sinon la pastille
+ * annoncerait 613 là où l'écran n'en montre que 40.
+ */
+export async function getHistoryActorCounts(sinceDays?: number, bootcampId?: string) {
+  const rows = await db.execute<{ actor: string | null; n: number }>(sql`
+    with e as (
+      select changed_at as at, changed_by as actor, lead_id from stage_history
+      union all select created_at, caller_id, reference_id from call_logs
+        where reference_type = 'lead'
+      union all select created_at, created_by, reference_id from activities
+        where reference_type = 'lead' and type in ('email', 'note', 'webhook_in')
+      union all select created_at, created_by, reference_id from comments
+        where reference_type = 'lead'
+      union all select created_at, created_by, reference_id from tasks
+        where reference_type = 'lead'
+      union all select paid_at, received_by, lead_id from payment_schedules
+        where is_paid and paid_at is not null
+    )
+    select e.actor, count(*)::int as n
+      from e left join leads l on l.id = e.lead_id
+     where ${sinceDays ? sql`e.at > now() - ${`${sinceDays} days`}::interval` : sql`true`}
+       and ${bootcampId ? sql`l.bootcamp_id = ${bootcampId}` : sql`true`}
+     group by e.actor order by n desc
+  `);
+  return rows.map((r) => ({ actor: r.actor, n: r.n }));
+}
+
+// ── Statistiques d'une formation ───────────────────────
+// Tout est cadré sur UNE formation et couvre TOUTE sa vie : une formation a un
+// début et une fin, elle EST la période. Seul le rythme garde une fenêtre de 7
+// jours, parce qu'un histogramme en a besoin — ce n'est pas un filtre.
+
+export type FormationStats = {
+  socle: { leads: number; veulentAppel: number; appels: number; inscrits: number };
+  rythme: { jour: string; arrivees: number; appels: number }[];
+  colonnes: { name: string; position: number; n: number }[];
+  delais: { min: number; moyen: number; max: number; surCombien: number } | null;
+  sejours: { name: string; passages: number; mediane: number }[];
+  gens: { actor: string | null; appels: number; aboutis: number; deplacements: number; commentaires: number }[];
+  argent: { encaisse: number; reste: number; enRetard: number; parMoyen: { method: string | null; n: number }[]; sansJustificatif: number };
+  emails: { envoyes: number; ouverts: number; cliques: number; liens: { url: string; n: number }[] };
+};
+
+export async function getFormationStats(bootcampId: string): Promise<FormationStats> {
+  const B = bootcampId;
+
+  const [socleRows, rythmeRows, colonnesRows, delaisRows, sejoursRows,
+         appelsRows, deplRows, commRows, argentRows, moyenRows, emailRows, liensRows] =
+    await Promise.all([
+      db.execute<{ leads: number; veulent: number; appels: number; inscrits: number }>(sql`
+        select
+          (select count(*)::int from leads where bootcamp_id = ${B}) as leads,
+          (select count(*)::int from leads where bootcamp_id = ${B} and wants_call) as veulent,
+          (select count(*)::int from call_logs c join leads l on l.id = c.reference_id
+            where c.reference_type = 'lead' and l.bootcamp_id = ${B}) as appels,
+          (select count(*)::int from leads where bootcamp_id = ${B} and converted) as inscrits
+      `),
+
+      // Un axe de 7 jours PLEIN : sans generate_series, une journée sans rien
+      // disparaîtrait du graphique au lieu d'y valoir zéro — et c'est justement
+      // les journées à zéro appel qui racontent quelque chose.
+      db.execute<{ jour: string; arrivees: number; appels: number }>(sql`
+        with jours as (
+          select generate_series(current_date - 6, current_date, '1 day')::date as j
+        )
+        select to_char(jours.j, 'DD/MM') as jour,
+               (select count(*)::int from leads
+                 where bootcamp_id = ${B} and created_at::date = jours.j) as arrivees,
+               (select count(*)::int from call_logs c join leads l on l.id = c.reference_id
+                 where c.reference_type = 'lead' and l.bootcamp_id = ${B}
+                   and c.created_at::date = jours.j) as appels
+          from jours order by jours.j
+      `),
+
+      db.execute<{ name: string; position: number; n: number }>(sql`
+        select s.name, s.position, count(l.id)::int as n
+          from lead_statuses s
+          left join leads l on l.status_id = s.id and l.bootcamp_id = ${B}
+         where s.bootcamp_id = ${B}
+         group by s.name, s.position order by s.position
+      `),
+
+      db.execute<{ min: number; moyen: number; max: number; sur: number }>(sql`
+        select round(min(extract(epoch from (converted_at - created_at))/86400)::numeric, 1) as min,
+               round(avg(extract(epoch from (converted_at - created_at))/86400)::numeric, 1) as moyen,
+               round(max(extract(epoch from (converted_at - created_at))/86400)::numeric, 1) as max,
+               count(*)::int as sur
+          from leads
+         where bootcamp_id = ${B} and converted and converted_at is not null
+      `),
+
+      // Temps passé dans une colonne = écart avec le déplacement SUIVANT du même
+      // lead. Médiane et non moyenne : un lead oublié trois mois fausserait tout.
+      db.execute<{ name: string; passages: number; mediane: number }>(sql`
+        select s.name, count(*)::int as passages,
+               round(percentile_cont(0.5) within group (
+                 order by extract(epoch from (suivant.changed_at - h.changed_at))/86400
+               )::numeric, 1) as mediane
+          from stage_history h
+          join leads l on l.id = h.lead_id and l.bootcamp_id = ${B}
+          join lead_statuses s on s.id = h.to_status_id
+          left join lateral (
+            select changed_at from stage_history x
+             where x.lead_id = h.lead_id and x.changed_at > h.changed_at
+             order by x.changed_at limit 1
+          ) suivant on true
+         where suivant.changed_at is not null
+         group by s.name order by passages desc
+      `),
+
+      db.execute<{ actor: string | null; appels: number; aboutis: number }>(sql`
+        select c.caller_id as actor, count(*)::int as appels,
+               count(*) filter (where c.status = 'completed')::int as aboutis
+          from call_logs c join leads l on l.id = c.reference_id
+         where c.reference_type = 'lead' and l.bootcamp_id = ${B}
+         group by c.caller_id
+      `),
+
+      db.execute<{ actor: string | null; n: number }>(sql`
+        select h.changed_by as actor, count(*)::int as n
+          from stage_history h join leads l on l.id = h.lead_id
+         where l.bootcamp_id = ${B} group by h.changed_by
+      `),
+
+      db.execute<{ actor: string | null; n: number }>(sql`
+        select cm.created_by as actor, count(*)::int as n
+          from comments cm join leads l on l.id = cm.reference_id
+         where cm.reference_type = 'lead' and l.bootcamp_id = ${B}
+         group by cm.created_by
+      `),
+
+      db.execute<{ encaisse: string; reste: string; retard: number; sans_just: number }>(sql`
+        select coalesce(sum(p.amount) filter (where p.is_paid), 0)::text as encaisse,
+               coalesce(sum(p.amount) filter (where not p.is_paid), 0)::text as reste,
+               count(*) filter (where not p.is_paid and p.due_date < now())::int as retard,
+               count(*) filter (where p.is_paid and p.proof_path is null)::int as sans_just
+          from payment_schedules p join leads l on l.id = p.lead_id
+         where l.bootcamp_id = ${B}
+      `),
+
+      db.execute<{ method: string | null; n: number }>(sql`
+        select p.method, count(*)::int as n
+          from payment_schedules p join leads l on l.id = p.lead_id
+         where l.bootcamp_id = ${B} and p.is_paid
+         group by p.method order by n desc
+      `),
+
+      db.execute<{ envoyes: number; ouverts: number; cliques: number }>(sql`
+        select count(*)::int as envoyes,
+               count(*) filter (where r.opened_at is not null)::int as ouverts,
+               count(*) filter (where r.clicked_at is not null)::int as cliques
+          from automation_runs r join automations a on a.id = r.automation_id
+         where a.bootcamp_id = ${B} and r.sent_at is not null
+      `),
+
+      db.execute<{ url: string; n: number }>(sql`
+        select k.url, count(*)::int as n
+          from automation_link_clicks k join automations a on a.id = k.automation_id
+         where a.bootcamp_id = ${B}
+         group by k.url order by n desc limit 6
+      `),
+    ]);
+
+  // Les trois mesures « par personne » viennent de trois tables : on les
+  // rassemble ici plutôt qu'en SQL, où trois FULL JOIN sur une clé qui peut
+  // être NULL donneraient des lignes fantômes.
+  const parActeur = new Map<string, FormationStats["gens"][number]>();
+  const ligne = (a: string | null) => {
+    const k = a ?? "__inconnu__";
+    if (!parActeur.has(k))
+      parActeur.set(k, { actor: a, appels: 0, aboutis: 0, deplacements: 0, commentaires: 0 });
+    return parActeur.get(k)!;
+  };
+  for (const r of appelsRows) { const l = ligne(r.actor); l.appels = r.appels; l.aboutis = r.aboutis; }
+  for (const r of deplRows) ligne(r.actor).deplacements = r.n;
+  for (const r of commRows) ligne(r.actor).commentaires = r.n;
+
+  const d = delaisRows[0];
+  const a = argentRows[0];
+  const e = emailRows[0];
+
+  return {
+    socle: {
+      leads: socleRows[0]?.leads ?? 0,
+      veulentAppel: socleRows[0]?.veulent ?? 0,
+      appels: socleRows[0]?.appels ?? 0,
+      inscrits: socleRows[0]?.inscrits ?? 0,
+    },
+    rythme: rythmeRows.map((r) => ({ jour: r.jour, arrivees: r.arrivees, appels: r.appels })),
+    colonnes: colonnesRows.map((r) => ({ name: r.name, position: r.position, n: r.n })),
+    delais: d && d.sur > 0
+      ? { min: Number(d.min), moyen: Number(d.moyen), max: Number(d.max), surCombien: d.sur }
+      : null,
+    sejours: sejoursRows.map((r) => ({
+      name: r.name, passages: r.passages, mediane: Number(r.mediane ?? 0),
+    })),
+    gens: [...parActeur.values()]
+      // L'import et les automatisations ne sont pas des « gens ».
+      .filter((g) => g.actor !== "webhook" && g.actor !== "automation")
+      .sort((x, y) => y.appels + y.deplacements - (x.appels + x.deplacements)),
+    argent: {
+      encaisse: Number(a?.encaisse ?? 0),
+      reste: Number(a?.reste ?? 0),
+      enRetard: a?.retard ?? 0,
+      parMoyen: moyenRows.map((r) => ({ method: r.method, n: r.n })),
+      sansJustificatif: a?.sans_just ?? 0,
+    },
+    emails: {
+      envoyes: e?.envoyes ?? 0,
+      ouverts: e?.ouverts ?? 0,
+      cliques: e?.cliques ?? 0,
+      liens: liensRows.map((r) => ({ url: r.url, n: r.n })),
+    },
+  };
+}
+
+// ── Les gens à qui s'adresser derrière un écart ────────
+// L'intérêt d'un conseil n'est pas la phrase, c'est la liste. Elle sort d'une
+// requête, pas d'un modèle : personne ne peut inventer un nom.
+
+export type GapTarget = {
+  id: string;
+  name: string | null;
+  phone: string | null;
+  raison: string;
+};
+
+export async function getGapTargets(
+  bootcampId: string,
+  kind: "jamais_appeles" | "colonne_bloquante" | "colonne_lente" | "paiements",
+  arg?: string
+): Promise<GapTarget[]> {
+  const B = bootcampId;
+
+  if (kind === "jamais_appeles") {
+    // Ceux qui ont DEMANDÉ qu'on les rappelle et qu'on n'a jamais appelés,
+    // les plus récents d'abord — un engagement frais se rappelle mieux.
+    const rows = await db.execute<{ id: string; full_name: string | null; mobile_no: string | null; jours: number; a_clique: boolean }>(sql`
+      select l.id, l.full_name, l.mobile_no,
+             extract(day from now() - l.created_at)::int as jours,
+             exists (select 1 from automation_runs r
+                      where r.lead_id = l.id and r.clicked_at is not null) as a_clique
+        from leads l
+       where l.bootcamp_id = ${B} and l.wants_call and not l.converted
+         and l.mobile_no is not null
+         and not exists (select 1 from call_logs c
+                          where c.reference_type = 'lead' and c.reference_id = l.id)
+       order by a_clique desc, l.created_at desc
+       limit 20
+    `);
+    return rows.map((r) => ({
+      id: r.id,
+      name: r.full_name,
+      phone: r.mobile_no,
+      raison: [r.a_clique ? "a cliqué la vidéo" : null, `inscrit il y a ${r.jours} j`]
+        .filter(Boolean)
+        .join(" · "),
+    }));
+  }
+
+  if (kind === "colonne_bloquante" || kind === "colonne_lente") {
+    const rows = await db.execute<{ id: string; full_name: string | null; mobile_no: string | null; jours: number; veut: boolean }>(sql`
+      select l.id, l.full_name, l.mobile_no,
+             extract(day from now() - coalesce(l.stage_entered_at, l.created_at))::int as jours,
+             coalesce(l.wants_call, false) as veut
+        from leads l join lead_statuses s on s.id = l.status_id
+       where l.bootcamp_id = ${B} and s.name = ${arg ?? ""} and not l.converted
+       order by coalesce(l.stage_entered_at, l.created_at) asc
+       limit 20
+    `);
+    return rows.map((r) => ({
+      id: r.id,
+      name: r.full_name,
+      phone: r.mobile_no,
+      raison: [`${r.jours} j sans bouger`, r.veut ? "a demandé un appel" : null]
+        .filter(Boolean)
+        .join(" · "),
+    }));
+  }
+
+  // paiements : ce qui est en retard d'abord, puis ce qui manque de preuve.
+  const rows = await db.execute<{ id: string; full_name: string | null; mobile_no: string | null; amount: string | null; retard: boolean; sans_preuve: boolean }>(sql`
+    select l.id, l.full_name, l.mobile_no, p.amount::text,
+           (not p.is_paid and p.due_date < now()) as retard,
+           (p.is_paid and p.proof_path is null) as sans_preuve
+      from payment_schedules p join leads l on l.id = p.lead_id
+     where l.bootcamp_id = ${B}
+       and ((not p.is_paid and p.due_date < now()) or (p.is_paid and p.proof_path is null))
+     order by retard desc, p.due_date asc
+     limit 20
+  `);
+  return rows.map((r) => ({
+    id: r.id,
+    name: r.full_name,
+    phone: r.mobile_no,
+    raison: [
+      r.amount ? `${Number(r.amount).toLocaleString("fr-FR")}` : null,
+      r.retard ? "échéance dépassée" : "encaissé sans justificatif",
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  }));
+}
+
+/**
+ * Les leads de cette formation qui ont AU MOINS un appel enregistré.
+ *
+ * Le kanban a besoin de l'inverse — « jamais appelé » — pour son filtre. On
+ * rend l'ensemble des appelés plutôt que des non-appelés : c'est le plus petit
+ * des deux (20 contre 246 sur september), donc le moins lourd à transporter.
+ */
+export async function getCalledByBootcamp(bootcampId: string): Promise<Set<string>> {
+  const rows = await db.execute<{ id: string }>(sql`
+    select distinct l.id
+      from leads l
+      join call_logs c on c.reference_type = 'lead' and c.reference_id = l.id
+     where l.bootcamp_id = ${bootcampId}
+  `);
+  return new Set(rows.map((r) => r.id));
+}
+
+/**
+ * Les messages automatiques encore À VENIR pour ce lead — ce que l'onglet
+ * Aperçu montre dans « À venir ». Une règle WhatsApp donne son modèle, une
+ * règle email le nom du modèle d'email.
+ */
+export async function getPendingAutomationsForLead(leadId: string) {
+  return db
+    .select({
+      id: automationRuns.id,
+      scheduledAt: automationRuns.scheduledAt,
+      reason: automationRuns.reason,
+      channel: automations.channel,
+      whatsappTemplate: automations.whatsappTemplate,
+      emailTemplateName: emailTemplates.name,
+    })
+    .from(automationRuns)
+    .innerJoin(automations, eq(automations.id, automationRuns.automationId))
+    .leftJoin(emailTemplates, eq(emailTemplates.id, automations.emailTemplateId))
+    .where(and(eq(automationRuns.leadId, leadId), eq(automationRuns.status, "pending")))
+    .orderBy(asc(automationRuns.scheduledAt));
+}

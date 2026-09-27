@@ -1,0 +1,241 @@
+import Link from "next/link";
+import { login, signup, requestPasswordReset, creerPremierProprietaire } from "./actions";
+import { aucunCompte } from "@/lib/premier-compte";
+
+const FIELD =
+  "w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-ring focus:ring-2 focus:ring-ring/30";
+
+export default async function LoginPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ error?: string; mode?: string; sent?: string }>;
+}) {
+  const { error, mode, sent } = await searchParams;
+  // Base injoignable ou pas encore installée : l'écran de connexion normal
+  // plutôt qu'une page d'erreur (la connexion dira ce qui ne va pas).
+  const premier = await aucunCompte().catch((e) => {
+    console.error("Premier compte : base illisible", e);
+    return false;
+  });
+  return <LoginContent error={error} mode={mode} sent={sent} premier={premier} />;
+}
+
+function LoginContent({
+  error,
+  mode,
+  sent,
+  premier,
+}: {
+  error?: string;
+  mode?: string;
+  sent?: string;
+  premier: boolean;
+}) {
+  const errorMessage =
+    error === "unauthorized"
+      ? "Inscription non autorisée pour cet email. Contacte l'administrateur."
+      : error === "lien_expire"
+        ? "Ce lien a déjà servi ou a expiré. Demande-en un nouveau."
+        : error === "lien_invalide"
+          ? "Ce lien est incomplet. Demande-en un nouveau."
+          : error === "lien_autre_appareil"
+            ? "Ce lien a été ouvert sur un autre appareil que celui qui l'a demandé, ou il a déjà servi. Redemande-en un depuis l'appareil où tu veux te connecter."
+          : error === "non_invitee"
+        ? "Cette adresse n'est pas invitée. Demande à l'administrateur de l'ajouter."
+        : error === "pas_de_compte"
+          ? "Cette adresse est bien invitée, mais aucun compte n'a encore été créé avec elle. Utilise « Créer un compte » ci-dessous plutôt que la réinitialisation."
+          : error === "deja_compte"
+            ? "Un compte existe déjà avec cette adresse. Connecte-toi, ou utilise « Oublié ? » pour choisir un nouveau mot de passe."
+          : error === "court"
+            ? "Le mot de passe doit faire au moins 8 caractères."
+          : error === "email_manquant"
+            ? "Saisis ton adresse email."
+          : error === "differents"
+            ? "Les deux mots de passe ne sont pas identiques."
+          : error === "premier_invalide"
+            ? "Email invalide, ou mot de passe de moins de 12 caractères."
+          : error === "premier_existe"
+            ? "Un propriétaire existe déjà. Connectez-vous."
+          : error === "premier_config"
+            ? "Il manque NEXT_PUBLIC_SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY (voir INSTALL.md)."
+          : error === "premier_echec"
+            ? "La création a échoué. Vérifiez les clés Supabase puis réessayez."
+            : error === "1"
+              ? "Email ou mot de passe incorrect."
+              : null;
+
+  const forgot = mode === "forgot";
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-background px-4">
+      <div className="w-full max-w-sm space-y-6">
+        <div className="text-center">
+          <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-lg bg-primary text-sm font-bold text-primary-foreground">
+            o
+          </div>
+          <h1 className="font-heading text-xl font-semibold text-foreground">openspace</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {premier
+              ? "Bienvenue — créez le compte propriétaire"
+              : forgot
+                ? "Réinitialiser ton mot de passe"
+                : "Connectez-vous pour continuer"}
+          </p>
+        </div>
+
+        <div className="space-y-4 rounded-xl border border-border bg-card p-6">
+          {errorMessage && (
+            <div className="rounded-lg border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-600 dark:text-red-400">
+              {errorMessage}
+            </div>
+          )}
+
+          {sent === "inscription" && (
+            <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-400">
+              Regarde ta boîte mail : un lien pour activer ton compte vient d&apos;y être
+              envoyé (pense aux spams). En cliquant dessus, tu choisis ton mot de passe.
+            </div>
+          )}
+
+          {premier ? (
+            <form className="space-y-3">
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                Ce compte aura tous les droits. Vous inviterez ensuite votre équipe depuis
+                Réglages → Équipe.
+              </p>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-muted-foreground">Email</label>
+                <input name="email" type="email" required autoFocus autoComplete="email" className={FIELD} />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                  Mot de passe (12 caractères minimum)
+                </label>
+                <input name="password" type="password" required minLength={12} autoComplete="new-password" className={FIELD} />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                  Mot de passe, encore une fois
+                </label>
+                <input name="password2" type="password" required minLength={12} autoComplete="new-password" className={FIELD} />
+              </div>
+              <button
+                formAction={creerPremierProprietaire}
+                type="submit"
+                className="w-full rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+              >
+                Créer le compte
+              </button>
+            </form>
+          ) : forgot ? (
+            sent ? (
+              <>
+                <p className="text-sm font-medium text-foreground">Regarde ta boîte mail.</p>
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  Si un compte existe avec cette adresse, un lien de réinitialisation vient
+                  d&apos;y être envoyé. Il ne sert qu&apos;une fois. Pense à regarder dans les
+                  spams.
+                </p>
+                <Link
+                  href="/login"
+                  className="inline-block text-xs text-muted-foreground underline hover:text-foreground"
+                >
+                  ← Revenir à la connexion
+                </Link>
+              </>
+            ) : (
+              <form action={requestPasswordReset} className="space-y-3">
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    Ton adresse email
+                  </label>
+                  <input name="email" type="email" required autoFocus className={FIELD} />
+                </div>
+                <button
+                  type="submit"
+                  className="w-full rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                >
+                  Recevoir un lien de réinitialisation
+                </button>
+                <Link
+                  href="/login"
+                  className="block text-center text-xs text-muted-foreground underline hover:text-foreground"
+                >
+                  ← Revenir à la connexion
+                </Link>
+              </form>
+            )
+          ) : (
+            <>
+              <form className="space-y-3">
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    Email
+                  </label>
+                  <input name="email" type="email" required className={FIELD} />
+                </div>
+                <div>
+                  <div className="mb-1 flex items-baseline justify-between">
+                    <label className="text-xs font-medium text-muted-foreground">
+                      Mot de passe
+                    </label>
+                    {/* Le seul recours pour qui a oublié : sans ce lien, il
+                        fallait passer par le tableau de bord Supabase. */}
+                    <Link
+                      href="/login?mode=forgot"
+                      className="text-[13px] text-muted-foreground underline hover:text-foreground"
+                    >
+                      Oublié ?
+                    </Link>
+                  </div>
+                  <input
+                    name="password"
+                    type="password"
+                    required
+                    autoComplete="current-password"
+                    className={FIELD}
+                  />
+                </div>
+                <button
+                  formAction={login}
+                  type="submit"
+                  className="w-full rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+                >
+                  Se connecter
+                </button>
+              </form>
+
+              <div className="relative">
+                <div className="h-px bg-border" />
+                <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-card px-2 text-xs text-muted-foreground">
+                  ou
+                </span>
+              </div>
+
+              <form className="space-y-3">
+                <input
+                  name="email"
+                  type="email"
+                  required
+                  placeholder="Email"
+                  className={FIELD}
+                />
+                <button
+                  formAction={signup}
+                  type="submit"
+                  className="w-full rounded-lg border border-border px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted"
+                >
+                  Créer un compte
+                </button>
+                <p className="text-[13px] text-muted-foreground">
+                  Réservé aux adresses invitées par l&apos;administrateur. Tu choisiras ton
+                  mot de passe après avoir cliqué sur le lien reçu par email.
+                </p>
+              </form>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

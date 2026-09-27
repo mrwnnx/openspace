@@ -1,0 +1,91 @@
+import { type NextRequest, NextResponse } from "next/server";
+import { createServerClient } from "@supabase/ssr";
+
+const PUBLIC_ROUTES = ["/login"];
+
+export async function proxy(request: NextRequest) {
+  const response = NextResponse.next({ request });
+  const pathname = request.nextUrl.pathname;
+
+  // Endpoints machine : pas de session cookie, ils portent leur propre auth.
+  // /api/webhook/* → token de form_source ; /api/cron/* → Bearer CRON_SECRET.
+  // Sans cette sortie, le cron Vercel reçoit un 307 vers /login et n'importe
+  // jamais rien — panne totalement silencieuse.
+  if (pathname.startsWith("/api/webhook") || pathname.startsWith("/api/cron")) {
+    return response;
+  }
+
+  // Désabonnement : le destinataire d'une campagne n'a évidemment pas de
+  // compte CRM. Sans cette sortie, le lien de désinscription renverrait vers
+  // /login — un lien mort, donc une obligation légale non remplie.
+  // /api/unsubscribe : le clic « Se désabonner » de Gmail (POST silencieux).
+  if (pathname.startsWith("/unsubscribe") || pathname.startsWith("/api/unsubscribe")) {
+    return response;
+  }
+
+  // Retour du lien magique : la session n'existe PAS ENCORE quand on arrive
+  // ici — c'est justement cette route qui l'ouvre. Sans cette sortie, le
+  // visiteur est renvoyé vers /login avant l'échange du code, et le lien reçu
+  // par email ne connecte jamais personne.
+  // Le manifeste de l'application installable : lu par le téléphone sans session.
+  if (pathname === "/manifest.webmanifest") return NextResponse.next();
+  if (pathname.startsWith("/auth/callback")) {
+    return response;
+  }
+
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return request.cookies.getAll();
+        },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value, options }) => {
+            request.cookies.set(name, value);
+            response.cookies.set(name, value, options as never);
+          });
+        },
+      },
+    }
+  );
+
+  // Borne l'appel auth : si Supabase stalle, on n'attend pas le timeout Vercel (300s).
+  // Timeout/erreur → user=null → traité comme non authentifié (redirige /login, le cas sûr).
+  //
+  // Les appels d'API (cloche, pastille WhatsApp : toutes les 15 s, dans chaque
+  // onglet) vérifient le jeton SUR PLACE (signature ES256, sans appel à Supabase) :
+  // ils faisaient ~2 300 appels Auth/heure, le quart du transfert.
+  // Les pages, elles, gardent l'appel à Supabase : un compte bloqué (retiré de
+  // l'équipe) est ainsi mis dehors dès la page suivante.
+  const verifier = pathname.startsWith("/api/")
+    ? supabase.auth.getClaims().then(({ data }) => (data?.claims?.sub ? data.claims : null))
+    : supabase.auth.getUser().then(({ data }) => data.user);
+  const user = await Promise.race([
+    verifier.catch(() => null),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+  ]);
+
+  const isPublic = PUBLIC_ROUTES.includes(pathname);
+
+  if (!user && !isPublic) {
+    const url = request.nextUrl.clone();
+    url.pathname = "/login";
+    return NextResponse.redirect(url);
+  }
+
+  if (user && pathname === "/login") {
+    const url = request.nextUrl.clone();
+    url.pathname = "/leads";
+    return NextResponse.redirect(url);
+  }
+
+  return response;
+}
+
+export const config = {
+  matcher: [
+    "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp|css|js|map|woff2|woff|ttf)$).*)",
+  ],
+};

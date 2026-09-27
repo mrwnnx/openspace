@@ -1,0 +1,136 @@
+{
+  "version": "7.3",
+  "screens": [
+    {
+      "id": "INSCRIPTION",
+      "title": "Inscription",
+      "terminal": true,
+      "success": true,
+      "data": {
+        "intro": {
+          "type": "string",
+          "__example__": "Complétez ces informations pour votre inscription à la prochaine session 👇"
+        },
+        "need_age": {
+          "type": "boolean",
+          "__example__": true
+        },
+        "need_situation": {
+          "type": "boolean",
+          "__example__": true
+        },
+        "need_plan": {
+          "type": "boolean",
+          "__example__": true
+        },
+        "formules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              }
+            }
+          },
+          "__example__": [
+            {
+              "id": "total",
+              "title": "En une fois — 900 EUR",
+              "description": "au lieu de 1000 EUR, remise de 10 %"
+            },
+            {
+              "id": "monthly",
+              "title": "En 3 fois — 3 × 350 EUR"
+            }
+          ]
+        },
+        "need_email": {
+          "type": "boolean",
+          "__example__": true
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextBody",
+            "text": "${data.intro}"
+          },
+          {
+            "type": "TextInput",
+            "name": "email",
+            "label": "Email",
+            "input-type": "email",
+            "visible": "${data.need_email}",
+            "required": "${data.need_email}"
+          },
+          {
+            "type": "TextInput",
+            "name": "age",
+            "label": "Âge",
+            "input-type": "number",
+            "visible": "${data.need_age}",
+            "required": "${data.need_age}"
+          },
+          {
+            "type": "RadioButtonsGroup",
+            "name": "situation",
+            "label": "Votre situation",
+            "visible": "${data.need_situation}",
+            "required": "${data.need_situation}",
+            "data-source": [
+              {
+                "id": "Salarié·e",
+                "title": "Salarié·e"
+              },
+              {
+                "id": "Étudiant·e",
+                "title": "Étudiant·e"
+              },
+              {
+                "id": "Sans emploi",
+                "title": "Sans emploi"
+              },
+              {
+                "id": "Freelance",
+                "title": "Freelance"
+              },
+              {
+                "id": "Autre",
+                "title": "Autre"
+              }
+            ]
+          },
+          {
+            "type": "RadioButtonsGroup",
+            "name": "formule",
+            "label": "Comment souhaitez-vous payer ?",
+            "visible": "${data.need_plan}",
+            "required": "${data.need_plan}",
+            "data-source": "${data.formules}"
+          },
+          {
+            "type": "Footer",
+            "label": "Confirmer l'inscription",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "age": "${form.age}",
+                "situation": "${form.situation}",
+                "formule": "${form.formule}",
+                "email": "${form.email}"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

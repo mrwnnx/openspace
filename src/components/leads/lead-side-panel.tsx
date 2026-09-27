@@ -1,0 +1,380 @@
+"use client";
+
+import { useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import {
+  updateLeadFieldAction,
+  updateLeadContactFieldAction,
+  grantWhatsAppConsentByPhoneAction,
+} from "@/app/actions";
+import { cn } from "@/lib/utils";
+import { OfferDialog } from "@/components/leads/offer-dialog";
+import type { CodeDuLead } from "@/lib/promo";
+import type { LeadSource, Bootcamp } from "@/db/schema";
+import type { Niveau } from "@/lib/droits-domaines";
+
+type LeadData = {
+  email: string | null;
+  mobileNo: string | null;
+  sourceId: string | null;
+  intendedPlan: string | null;
+  offerTotal: string | null;
+  offerMonthlyCount: number | null;
+  offerMonthlyAmount: string | null;
+  promoCode: string | null;
+  motivation: string | null;
+  wantsCall: boolean | null;
+  qualification: string | null;
+  nextFollowUpAt: Date | null;
+};
+
+type ContactData = {
+  whatsapp: string | null;
+  age: number | null;
+  whatsappConsentAt?: Date | null;
+  whatsappConsentSource?: string | null;
+  whatsappUnsubscribedAt?: Date | null;
+  unsubscribedAt?: Date | null;
+  bouncedAt?: Date | null;
+  bounceReason?: string | null;
+};
+
+const QUALIF_LABEL: Record<string, string> = {
+  chaud: "🔥 Chaud",
+  tiede: "Tiède",
+  froid: "Froid",
+  pas_serieux: "Pas sérieux",
+  hors_cible: "Hors cible",
+  reporte: "Reporté à une prochaine session",
+};
+
+export function LeadSidePanel({
+  leadId,
+  lead,
+  schedule,
+  contactId,
+  contact,
+  sources,
+  bootcamp,
+  codeReconnu,
+  argent,
+}: {
+  /** Droit « argent » du membre : "aucun" masque l'offre et les prix du code. */
+  argent: Niveau;
+  /** Le code promo reconnu dans ce que le lead a tapé (Paramètres → Codes promo). */
+  codeReconnu?: CodeDuLead | null;
+  /** Présent seulement si le lead est inscrit : l'argent vit là, pas dans `intendedPlan`. */
+  schedule?: { paid: number; total: number } | null;
+  leadId: string;
+  lead: LeadData;
+  contactId: string | null;
+  contact: ContactData;
+  sources: LeadSource[];
+  bootcamp?: Bootcamp | null;
+}) {
+  const router = useRouter();
+  const [editingOffer, setEditingOffer] = useState(false);
+  const [consentPending, startConsent] = useTransition();
+  return (
+    <div className="flex flex-col gap-0.5 p-4">
+      {(lead.qualification || lead.nextFollowUpAt) && (
+        // État commercial courant, posé au dernier appel. L'historique complet
+        // est dans le fil d'activité à droite.
+        <div className="mb-3 rounded-lg border border-border bg-muted/30 p-2.5">
+          {lead.qualification && (
+            <p className="text-xs font-medium text-foreground">
+              {QUALIF_LABEL[lead.qualification] ?? lead.qualification}
+            </p>
+          )}
+          {lead.nextFollowUpAt && (
+            <p className="mt-0.5 text-[13px] text-primary">
+              À rappeler le {new Date(lead.nextFollowUpAt).toLocaleDateString("fr-FR")}
+            </p>
+          )}
+        </div>
+      )}
+
+      <p className="mb-2 text-[12px] font-semibold uppercase tracking-wide text-muted-foreground">
+        Coordonnées
+      </p>
+      <EditableField
+        field="email"
+        label="Email"
+        value={lead.email}
+        type="email"
+        onSave={(f, v) => updateLeadFieldAction(leadId, f, v)}
+      />
+      {contact.bouncedAt && (
+        // Une adresse morte doit se voir sur la fiche : sinon on relance
+        // quelqu'un qui ne recevra jamais rien.
+        <p className="mb-1 rounded-md bg-red-50 px-2 py-1 text-xs text-red-700">
+          Adresse invalide — exclue des campagnes
+          {contact.bounceReason ? ` (${contact.bounceReason})` : ""}
+        </p>
+      )}
+      {contact.unsubscribedAt && (
+        // Signalé ici parce que c'est là qu'on écrit à quelqu'un : sans ce
+        // marqueur, on croirait un silence alors que la personne a demandé
+        // à ne plus être contactée.
+        <p className="mb-1 rounded-md bg-amber-50 px-2 py-1 text-xs text-amber-700">
+          Désabonné des campagnes — les emails 1-à-1 restent possibles
+        </p>
+      )}
+      <EditableField
+        field="mobileNo"
+        label="Téléphone"
+        value={lead.mobileNo}
+        onSave={(f, v) => updateLeadFieldAction(leadId, f, v)}
+      />
+      {lead.wantsCall !== null && (
+        // Réponse donnée au formulaire : c'est une consigne de la personne,
+        // pas un champ qu'on corrige — d'où la lecture seule.
+        <p
+          className={cn(
+            "mb-1 rounded-md px-2 py-1 text-xs",
+            lead.wantsCall ? "bg-green-50 text-green-700" : "bg-muted text-muted-foreground"
+          )}
+        >
+          {lead.wantsCall
+            ? "A demandé à être rappelé par téléphone"
+            : "Ne souhaite pas être rappelé par téléphone"}
+        </p>
+      )}
+      {contactId && (
+        <>
+          <EditableField
+            field="whatsapp"
+            label="WhatsApp"
+            value={contact.whatsapp}
+            onSave={(f, v) => updateLeadContactFieldAction(leadId, contactId, f, v)}
+          />
+          {contact.whatsappUnsubscribedAt ? (
+            <p className="mb-1 rounded-md bg-amber-50 px-2 py-1 text-xs text-amber-700">
+              A répondu STOP le {new Date(contact.whatsappUnsubscribedAt).toLocaleDateString("fr-FR")} —
+              plus aucun message automatique WhatsApp (un START ou une nouvelle case cochée le lève)
+            </p>
+          ) : contact.whatsappConsentAt ? (
+            // Preuve exigée par Meta avant tout premier message : lecture
+            // seule, c'est la personne qui l'a donnée, pas nous.
+            <p className="mb-1 rounded-md bg-green-50 px-2 py-1 text-xs text-green-700">
+              A accepté d'être contacté sur WhatsApp le{" "}
+              {new Date(contact.whatsappConsentAt).toLocaleDateString("fr-FR")}
+              {contact.whatsappConsentSource ? ` (${contact.whatsappConsentSource})` : ""}
+            </p>
+          ) : (
+            <div className="mb-1 rounded-md bg-muted px-2 py-1 text-xs text-muted-foreground">
+              Pas de consentement WhatsApp — seul un message lié à sa demande peut partir.{" "}
+              {/* L'opt-in oral compte pour Meta s'il est tracé : la date et
+                  l'auteur sont posés par l'action, pas par ce bouton. */}
+              <button
+                type="button"
+                disabled={consentPending}
+                onClick={() =>
+                  startConsent(async () => {
+                    await grantWhatsAppConsentByPhoneAction(leadId, contactId);
+                    router.refresh();
+                  })
+                }
+                className="font-medium text-primary underline disabled:opacity-50"
+              >
+                {consentPending ? "Enregistrement…" : "Il a dit oui par téléphone"}
+              </button>
+            </div>
+          )}
+          <EditableField
+            field="age"
+            label="Âge"
+            type="number"
+            value={contact.age != null ? String(contact.age) : null}
+            onSave={(f, v) => updateLeadContactFieldAction(leadId, contactId, f, v)}
+          />
+        </>
+      )}
+
+      <p className="mb-2 mt-4 text-[12px] font-semibold uppercase tracking-wide text-muted-foreground">
+        Classification
+      </p>
+      <EditableSelect
+        leadId={leadId}
+        field="sourceId"
+        label="Source"
+        value={lead.sourceId}
+        options={sources.map((s) => ({ value: s.id, label: s.name }))}
+      />
+
+      {bootcamp && argent !== "aucun" && (
+        <div className="flex items-start justify-between gap-2 px-4 py-2">
+          <span className="shrink-0 text-xs text-muted-foreground">Offre</span>
+          <div className="min-w-0 text-right">
+            <p className="text-xs font-medium text-foreground">
+              {lead.intendedPlan === "total"
+                ? `Comptant — ${lead.offerTotal ?? bootcamp.priceTotal ?? "?"} ${bootcamp.currency}`
+                : lead.intendedPlan === "monthly"
+                  ? `${lead.offerMonthlyCount ?? bootcamp.monthlyCount ?? "?"} × ${
+                      lead.offerMonthlyAmount ?? bootcamp.monthlyAmount ?? "?"
+                    } ${bootcamp.currency}`
+                  : "—"}
+            </p>
+            {/* Dire quand le montant vient du catalogue et non d'une
+                négociation : les deux se ressemblent à l'écran. */}
+            {lead.intendedPlan && !lead.offerTotal && (
+              <p className="text-[12px] text-muted-foreground">tarif de la formation</p>
+            )}
+            {argent === "gerer" && (
+            <button
+              onClick={() => setEditingOffer(true)}
+              className="mt-0.5 text-[13px] font-medium text-primary underline"
+            >
+              Changer l&apos;offre
+            </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {editingOffer && bootcamp && (
+        <OfferDialog
+          leadId={leadId}
+          currency={bootcamp.currency ?? "TND"}
+          current={{
+            plan: lead.intendedPlan,
+            total: lead.offerTotal ?? bootcamp.priceTotal,
+            count: lead.offerMonthlyCount ?? bootcamp.monthlyCount,
+            amount: lead.offerMonthlyAmount ?? bootcamp.monthlyAmount,
+          }}
+          enrolled={!!schedule}
+          paid={schedule?.paid}
+          onClose={() => setEditingOffer(false)}
+        />
+      )}
+      <EditableField
+        field="promoCode"
+        label="Code promo"
+        value={lead.promoCode}
+        onSave={(f, v) => updateLeadFieldAction(leadId, f, v)}
+      />
+      {lead.promoCode?.trim() && (
+        <p className="-mt-0.5 mb-1 text-right text-[12.5px] text-muted-foreground">
+          {!codeReconnu
+            ? "Code non reconnu — à créer dans Paramètres → Codes promo"
+            : !codeReconnu.valable
+              ? `${codeReconnu.code} — pas valable pour cette formation aujourd'hui`
+              : argent === "aucun"
+                ? `✓ ${codeReconnu.code}`
+                : [
+                  `✓ ${codeReconnu.code}`,
+                  codeReconnu.total != null ? `${codeReconnu.total} ${bootcamp?.currency ?? "TND"} en une fois` : "pas en une fois",
+                  codeReconnu.mensualite != null
+                    ? `${bootcamp?.monthlyCount} × ${codeReconnu.mensualite} en facilité`
+                    : "pas en facilité",
+                ].join(" · ")}
+        </p>
+      )}
+
+      {lead.motivation && (
+        <>
+          <p className="mb-2 mt-4 text-[12px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Motivation
+          </p>
+          <p className="whitespace-pre-wrap rounded-md bg-muted/50 px-2 py-2 text-xs leading-relaxed text-foreground">
+            {lead.motivation}
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+function EditableField({
+  field,
+  label,
+  value,
+  type = "text",
+  onSave,
+}: {
+  field: string;
+  label: string;
+  value: string | null;
+  type?: string;
+  onSave: (field: string, value: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState(value || "");
+  const [, startTransition] = useTransition();
+
+  function save() {
+    setEditing(false);
+    if (val !== (value || "")) {
+      startTransition(() => onSave(field, val));
+    }
+  }
+
+  return (
+    <div
+      className="group -mx-2 flex items-center justify-between rounded-md px-2 py-1.5 transition-colors hover:bg-muted/50"
+      onClick={() => !editing && setEditing(true)}
+    >
+      <span className="text-xs text-muted-foreground">{label}</span>
+      {editing ? (
+        <input
+          type={type}
+          value={val}
+          onChange={(e) => setVal(e.target.value)}
+          onBlur={save}
+          onKeyDown={(e) => e.key === "Enter" && save()}
+          autoFocus
+          className="w-40 rounded border border-ring bg-background px-2 py-0.5 text-xs text-foreground outline-none"
+        />
+      ) : (
+        <span
+          className={cn(
+            "text-xs font-medium",
+            value ? "text-foreground" : "text-muted-foreground/70"
+          )}
+        >
+          {value || "—"}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function EditableSelect({
+  leadId,
+  field,
+  label,
+  value,
+  options,
+}: {
+  leadId: string;
+  field: string;
+  label: string;
+  value: string | null;
+  options: { value: string; label: string }[];
+}) {
+  const [isPending, startTransition] = useTransition();
+
+  function change(newVal: string) {
+    if (newVal !== (value || "")) {
+      startTransition(() => updateLeadFieldAction(leadId, field, newVal));
+    }
+  }
+
+  return (
+    <div className="-mx-2 flex items-center justify-between rounded-md px-2 py-1.5 transition-colors hover:bg-muted/50">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <select
+        value={value || ""}
+        onChange={(e) => change(e.target.value)}
+        className="rounded border border-transparent bg-transparent px-1 py-0.5 text-xs font-medium text-foreground outline-none hover:border-border"
+      >
+        <option value="">—</option>
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}

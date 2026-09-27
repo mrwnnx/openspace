@@ -1,0 +1,327 @@
+import { getAllowedEmails, getAccountsOutsideAllowlist, getEmailTemplates, getWpConnectionPublic, getEmailBranding, getTags } from "@/lib/queries";
+import { currentActor } from "@/lib/auth";
+import { PageHeader } from "@/components/page-header";
+import { EmailTemplatesManager } from "@/components/settings/email-templates-manager";
+import { WpConnectionForm } from "@/components/settings/wp-connection-form";
+import { TeamManager } from "@/components/settings/team-manager";
+import { EmailDesignForm } from "@/components/settings/email-design-form";
+import { SettingsTabs, SETTINGS_TABS, type SettingsTab } from "@/components/settings/settings-tabs";
+import { a, mesDroits } from "@/lib/droits";
+import { ProfileForm } from "@/components/settings/profile-form";
+import { NotificationsTelephone } from "@/components/settings/notifications-telephone";
+import { createClient } from "@/lib/supabase/server";
+import { WhatsAppSettings } from "@/components/settings/whatsapp-settings";
+import { getWhatsAppNumber, getWhatsAppProfile, listWhatsAppTemplates, sendMode, allowlist } from "@/lib/messaging/whatsapp";
+import { getWhatsAppSettings } from "@/lib/whatsapp-settings";
+import { listerSavoir } from "@/lib/ai/knowledge";
+import { listButtonActions } from "@/lib/whatsapp-button-actions";
+import { getQuickReplies } from "@/lib/whatsapp-inbox";
+import { CodesPromo } from "@/components/settings/codes-promo";
+import { listerCodes, statsCodes } from "@/lib/promo";
+import { getBootcamps } from "@/lib/queries";
+import { OrganisationForm } from "@/components/settings/organisation-form";
+import { getOrganisation } from "@/lib/organisation";
+
+export const dynamic = "force-dynamic";
+
+export default async function SettingsPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ tab?: string }>;
+}) {
+  const { tab } = await searchParams;
+  const demande: SettingsTab =
+    tab === "site" || tab === "emails" || tab === "providers" || tab === "team" || tab === "branding" || tab === "whatsapp" || tab === "profile" || tab === "promo"
+      ? tab
+      : "ecole";
+  // « Mon profil » est à chacun ; « Équipe » aux propriétaires ; le reste
+  // demande le droit de gérer les réglages.
+  const droits = await mesDroits();
+  const visibles = SETTINGS_TABS.map((t) => t.id).filter((id) =>
+    id === "profile" ? true : id === "team" ? droits.proprietaire : a(droits, "reglages", "gerer")
+  );
+  const current: SettingsTab = visibles.includes(demande) ? demande : "profile";
+  const voirArgent = a(droits, "argent", "voir");
+
+  // Une seule requête, celle de l'onglet affiché (le pool DB est dimensionné
+  // sur la concurrence par requête HTTP — cf. gotcha max/pooler).
+  const wpConnection = current === "site" ? await getWpConnectionPublic() : null;
+  const ecole = current === "ecole" ? await getOrganisation() : null;
+  // L'aperçu d'un modèle doit montrer l'email TEL QU'IL PARTIRA, habillage
+  // compris — sinon on valide une mise en page qu'on ne verra jamais.
+  const templates = current === "emails" ? await getEmailTemplates() : [];
+  const templateBranding = current === "emails" ? await getEmailBranding() : null;
+  // Adresse du compte connecté : pré-remplit le champ « envoyer un test ».
+  const testEmail =
+    current === "emails" || current === "branding" ? ((await currentActor()) ?? "") : "";
+  const allowed = current === "team" ? await getAllowedEmails() : [];
+  const outsideAccounts = current === "team" ? await getAccountsOutsideAllowlist() : [];
+  const branding = current === "branding" ? await getEmailBranding() : null;
+  // Le profil du compte connecté, lu sur la session : chacun ne voit et ne
+  // modifie que le sien.
+  const me =
+    current === "profile"
+      ? await (async () => {
+          const supabase = await createClient();
+          const { data } = await supabase.auth.getUser();
+          const u = data.user;
+          return u
+            ? {
+                email: u.email ?? "",
+                name: (u.user_metadata?.full_name as string | null) ?? null,
+                avatarUrl: (u.user_metadata?.avatar_url as string | null) ?? null,
+              }
+            : null;
+        })()
+      : null;
+  // WhatsApp : le numéro et les modèles viennent de Meta, l'interrupteur de la base.
+  const [waNumero, waTemplates, waSettings, waQuick, waProfil, waActions, waTags, waSavoir] =
+    current === "whatsapp"
+      ? await Promise.all([
+          getWhatsAppNumber(),
+          listWhatsAppTemplates(),
+          getWhatsAppSettings(),
+          getQuickReplies(),
+          getWhatsAppProfile(),
+          listButtonActions(),
+          getTags(),
+          listerSavoir(),
+        ])
+      : [null, [], null, [], null, [], [], []];
+
+  const [promos, promoStats, promoFormations] =
+    current === "promo" ? await Promise.all([listerCodes(), statsCodes(), getBootcamps()]) : [[], null, []];
+
+  return (
+    <>
+      <PageHeader title="Settings" subtitle="Configuration du CRM" />
+      <div className="flex-1 overflow-y-auto p-5">
+        {/* L'onglet Design a besoin de place : un aperçu mobile de 390 px ne
+            tient pas dans une colonne de 2xl, et le sélecteur semblait inerte. */}
+        <div
+          className={`mx-auto space-y-6 ${
+            current === "branding" ? "max-w-[1180px]" : "max-w-2xl"
+          }`}
+        >
+          <SettingsTabs current={current} visibles={visibles} />
+
+          {current === "ecole" && ecole && (
+          <section>
+            <h2 className="mb-1 text-sm font-semibold text-foreground font-heading">Votre école</h2>
+            <p className="mb-4 text-xs text-muted-foreground">
+              Le nom et la description servent à l&apos;assistant IA, aux emails et aux pages publiques.
+            </p>
+            <OrganisationForm initial={ecole} />
+          </section>
+          )}
+
+          {current === "site" && (
+          /* Connexion au site WordPress */
+          <section>
+            <h2 className="mb-1 text-sm font-semibold text-foreground font-heading">
+              Connexion site — WordPress
+            </h2>
+            <p className="mb-4 text-xs text-muted-foreground">
+              Identifiants utilisés pour lire les soumissions de formulaire Elementor du
+              site et les importer comme leads.
+            </p>
+            <WpConnectionForm connection={wpConnection} />
+          </section>
+          )}
+
+          {current === "emails" && (
+          /* Email Templates section */
+          <section>
+            <h2 className="mb-1 text-sm font-semibold text-foreground font-heading">
+              Email Templates
+            </h2>
+            <p className="mb-2 text-xs text-muted-foreground">
+              Modèles d&apos;emails réutilisables. Variables disponibles:{" "}
+              {[
+                "firstName",
+                "lastName",
+                "fullName",
+                "formation",
+                "dateDebut",
+                "offre",
+                "subject",
+                "content",
+              ].map((v, i) => (
+                <span key={v}>
+                  {i > 0 && ", "}
+                  <code className="rounded bg-muted px-1 text-[12px]">{`{{${v}}}`}</code>
+                </span>
+              ))}
+            </p>
+            {/* Dit franchement où elles sont remplacées : ailleurs elles
+                partent vides, et rien à l'écran ne le signalerait. */}
+            <p className="mb-4 text-[13px] text-muted-foreground/80">
+              Les variables du lead ({`{{firstName}}`}, {`{{formation}}`},{" "}
+              {`{{dateDebut}}`}, {`{{offre}}`}) sont remplacées dans les{" "}
+              <strong className="font-medium">automatisations de colonne</strong>{" "}
+              du pipeline. Une campagne, elle, n&apos;en remplace aucune.
+            </p>
+            <EmailTemplatesManager
+              templates={templates}
+              branding={templateBranding}
+              testEmail={testEmail}
+            />
+          </section>
+          )}
+
+          {current === "branding" && (
+          /* Enveloppe commune à tous les emails */
+          <section>
+            {/* Le titre vit dans le composant, avec le bouton d'enregistrement. */}
+            <EmailDesignForm
+              branding={branding}
+              defaultSender={process.env.EMAIL_FROM ?? "Expéditeur non configuré"}
+              testEmail={testEmail}
+            />
+          </section>
+          )}
+
+          {current === "profile" && me && (
+          <section>
+            <h2 className="mb-1 text-sm font-semibold text-foreground font-heading">
+              Mon profil
+            </h2>
+            <p className="mb-4 text-xs text-muted-foreground">
+              Le nom et la photo que l&apos;équipe voit à côté de vos actions —
+              historique, encaissements, messages WhatsApp.
+            </p>
+            <ProfileForm me={me} />
+            <div className="mt-6">
+              <NotificationsTelephone />
+            </div>
+          </section>
+          )}
+
+          {current === "team" && (
+          /* Collaborateurs autorisés à créer un compte */
+          <section>
+            <h2 className="mb-1 text-sm font-semibold text-foreground font-heading">
+              Équipe
+            </h2>
+            <p className="mb-4 text-xs text-muted-foreground">
+              Seuls les emails de cette liste peuvent créer un compte sur le CRM.
+              Retirer un email empêche une future inscription mais ne supprime pas
+              un compte déjà créé (ça se fait dans le dashboard Supabase).
+            </p>
+            <TeamManager emails={allowed} outside={outsideAccounts} />
+          </section>
+          )}
+
+          {current === "whatsapp" && waNumero && waSettings && waProfil && (
+            <WhatsAppSettings
+              numero={waNumero}
+              profil={waProfil}
+              envoi={{ mode: sendMode(), allowlist: allowlist() }}
+              templates={waTemplates}
+              buttonActions={waActions.map((a) => ({
+                template: a.template,
+                buttonText: a.buttonText,
+                tagId: a.tagId,
+                replyText: a.replyText,
+                callSlot: a.callSlot,
+                optOut: a.optOut,
+              }))}
+              tags={waTags.map((t) => ({ id: t.id, name: t.name }))}
+              assistant={{
+                mode: waSettings.aiMode,
+                threshold: waSettings.aiThreshold,
+                instructions: waSettings.aiInstructions,
+                testers: waSettings.aiTesters,
+                savoir: waSavoir.map((k) => ({
+                  id: k.id,
+                  kind: k.kind,
+                  title: k.title,
+                  content: k.content,
+                  source: k.source,
+                  status: k.status,
+                  createdAt: k.createdAt.toISOString(),
+                })),
+              }}
+              quickReplies={waQuick.map((q) => ({ id: q.id, shortcut: q.shortcut, text: q.text }))}
+              autoReplies={{
+                welcomeEnabled: waSettings.welcomeEnabled,
+                welcomeText: waSettings.welcomeText,
+                awayEnabled: waSettings.awayEnabled,
+                awayText: waSettings.awayText,
+                awayStart: waSettings.awayStart,
+                awayEnd: waSettings.awayEnd,
+                awayDays: waSettings.awayDays.split(",").map(Number).filter(Boolean),
+              }}
+            />
+          )}
+
+          {current === "promo" && promoStats && (
+            <CodesPromo
+              codes={promos.map((c) => {
+                const s = promoStats.parCode.find((x) => x.id === c.id);
+                return {
+                  id: c.id,
+                  code: c.code,
+                  label: c.label,
+                  source: c.source,
+                  remiseTotalPct: c.remiseTotalPct ?? "",
+                  remiseFacilitePct: c.remiseFacilitePct ?? "",
+                  validFrom: c.validFrom ?? "",
+                  validUntil: c.validUntil ?? "",
+                  bootcampIds: (c.bootcampIds as string[]) ?? [],
+                  assistantPeutProposer: c.assistantPeutProposer,
+                  actif: c.actif,
+                  leads: s?.leads ?? 0,
+                  inscrits: s?.inscrits ?? 0,
+                  // 0 = la ligne « DT encaissés » ne s'affiche pas.
+                  encaisse: voirArgent ? Number(s?.encaisse ?? 0) : 0,
+                };
+              })}
+              inconnus={promoStats.inconnus}
+              formations={promoFormations.map((f) => ({ id: f.id, name: f.name }))}
+            />
+          )}
+
+          {current === "providers" && (
+          /* Messaging providers status */
+          <section className="rounded-xl border border-border bg-card p-5">
+            <h2 className="mb-3 text-sm font-semibold text-foreground font-heading">
+              Providers
+            </h2>
+            <div className="space-y-2 text-xs">
+              <ProviderRow
+                name="Resend (Email)"
+                configured={!!process.env.RESEND_API_KEY}
+              />
+              <ProviderRow
+                name="WhatsApp (API Cloud de Meta)"
+                configured={!!process.env.WHATSAPP_TOKEN && !!process.env.WHATSAPP_PHONE_ID}
+              />
+            </div>
+            <p className="mt-3 text-[12px] text-muted-foreground/70">
+              Configurez les clés dans .env.local pour activer l'envoi.
+            </p>
+          </section>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function ProviderRow({ name, configured }: { name: string; configured: boolean }) {
+  return (
+    <div className="flex items-center justify-between">
+      <span className="text-muted-foreground">{name}</span>
+      <span
+        className={
+          configured
+            ? "rounded-full bg-green-50 px-2 py-0.5 font-medium text-green-700"
+            : "rounded-full bg-gray-50 px-2 py-0.5 font-medium text-muted-foreground"
+        }
+      >
+        {configured ? "Configuré" : "Non configuré"}
+      </span>
+    </div>
+  );
+}

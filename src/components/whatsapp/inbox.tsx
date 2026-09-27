@@ -1,0 +1,1356 @@
+"use client";
+
+import { BoutonMediasLead } from "@/components/whatsapp/medias-lead";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { HugeiconsIcon } from "@hugeicons/react";
+import { ArrowLeft01Icon, Attachment01Icon, Mic01Icon, Search01Icon, WhatsappIcon } from "@hugeicons/core-free-icons";
+import { cn, formatRelative, initials } from "@/lib/utils";
+import { useTeamProfiles } from "@/components/team-profiles";
+import type { WhatsAppTemplate } from "@/lib/messaging/whatsapp";
+import {
+  assignBootcampAction,
+  markWhatsAppReadAction,
+  markWhatsAppUnreadAction,
+  reactWhatsAppAction,
+  replyWhatsAppAction,
+  envoyerEmplacementAction,
+  envoyerContactAction,
+  envoyerChoixAction,
+  assignerConversationAction,
+  noteInterneAction,
+  remarqueAssistantAction,
+  replyWhatsAppTemplateAction,
+  sendWhatsAppMediaAction,
+  whatsAppComposerDataAction,
+  setWhatsAppArchivedAction,
+} from "@/app/whatsapp-actions";
+import { getTeamAction } from "@/app/actions";
+
+/*
+ * La boîte WhatsApp : conversations à gauche, le fil à droite.
+ *
+ * Pas de temps réel : la page se rafraîchit toutes les 10 s (onglet visible), ce qui suffit à
+ * une équipe de deux personnes et n'exige aucun serveur de plus. Les données
+ * viennent du serveur à chaque rafraîchissement ; ce composant ne garde en
+ * mémoire que ce qui est en train d'être tapé.
+ */
+
+const RAFRAICHISSEMENT_MS = 10_000;
+
+type Conversation = {
+  leadId: string;
+  fullName: string;
+  mobileNo: string | null;
+  bootcamp: string | null;
+  lastAt: string;
+  lastDirection: "inbound" | "outbound";
+  lastContent: string | null;
+  lastInboundAt: string | null;
+  unread: number;
+  archived: boolean;
+  assignedTo: string | null;
+};
+
+type Message = {
+  id: string;
+  direction: "inbound" | "outbound";
+  content: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  status: "sent" | "delivered" | "read" | "failed" | "received" | null;
+  error: string | null;
+  media: { kind: "image" | "video" | "audio" | "document" | "sticker"; url: string; mimeType: string | null; filename: string | null } | null;
+  wamid: string | null;
+  replyTo: { content: string | null; direction: "inbound" | "outbound" } | null;
+  reactionLead: string | null;
+  reactionUs: string | null;
+  interne?: boolean;
+};
+
+type QuickReply = { shortcut: string; text: string };
+
+/** Ce que la zone de réponse cite : posé par « Répondre » sur une bulle. */
+type Citation = { wamid: string; content: string | null; direction: "inbound" | "outbound" };
+
+const EMOJIS = ["👍", "❤️", "😂", "🙏", "👏", "✅"];
+
+type Thread = {
+  archived: boolean;
+  assignedTo: string | null;
+  lead: { id: string; fullName: string; mobileNo: string | null; email: string | null; bootcamp: string | null };
+  messages: Message[];
+  lastInboundAt: string | null;
+  ouverte: boolean; // fenêtre de 24 h ouverte — décidé côté serveur, à l'heure du serveur
+  // Ce que l'assistant WhatsApp propose de répondre, en attente d'un humain.
+  proposition: { id: string; question: string; draft: string; score: number; decision: string; raisons: string } | null;
+};
+
+type Bootcamp = { id: string; name: string };
+
+export function WhatsAppInbox({
+  conversations,
+  thread,
+  templates,
+  bootcamps,
+  quickReplies,
+  q,
+  archives,
+  gerer,
+}: {
+  /** « WhatsApp : gérer ». Sans lui, les conversations se lisent seulement. */
+  gerer: boolean;
+  conversations: Conversation[];
+  thread: Thread | null;
+  templates: WhatsAppTemplate[];
+  bootcamps: Bootcamp[];
+  quickReplies: QuickReply[];
+  q: string;
+  archives: boolean;
+}) {
+  const router = useRouter();
+
+  // Onglet caché = personne ne lit : on ne recharge rien (le transfert Supabase
+  // est compté), et on rattrape d'un coup dès que l'onglet revient.
+  // Recharger toute la page toutes les 10 s coûtait ~2 200 lectures de la liste
+  // par jour (27/09) : on ne demande plus que « y a-t-il du nouveau ? » (une
+  // requête minuscule) et on recharge seulement s'il y en a — plus un
+  // rechargement complet par minute pour les accusés « Vu ».
+  useEffect(() => {
+    let dernier: string | null | undefined;
+    let tours = 0;
+    const t = setInterval(async () => {
+      if (document.visibilityState !== "visible") return;
+      tours++;
+      try {
+        const res = await fetch("/api/whatsapp/unread", { cache: "no-store" });
+        const d = (await res.json()) as { latest?: { leadId: string; at: string } | null };
+        const cle = d.latest ? `${d.latest.leadId}:${d.latest.at}` : null;
+        const nouveau = dernier !== undefined && cle !== dernier;
+        dernier = cle;
+        if (nouveau || tours % 6 === 0) router.refresh();
+      } catch {
+        if (tours % 6 === 0) router.refresh();
+      }
+    }, RAFRAICHISSEMENT_MS);
+    function auRetour() {
+      if (document.visibilityState === "visible") router.refresh();
+    }
+    document.addEventListener("visibilitychange", auRetour);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", auRetour);
+    };
+  }, [router]);
+
+  const visibles = conversations.filter((c) => c.archived === archives);
+  const nbArchivees = conversations.filter((c) => c.archived).length;
+
+  function url(p: { q?: string; archives?: boolean; lead?: string | null }) {
+    const sp = new URLSearchParams();
+    const qq = p.q ?? q;
+    const aa = p.archives ?? archives;
+    if (qq) sp.set("q", qq);
+    if (aa) sp.set("archives", "1");
+    const lead = p.lead === undefined ? thread?.lead.id : p.lead;
+    if (lead) sp.set("lead", lead);
+    const qs = sp.toString();
+    return `/whatsapp${qs ? `?${qs}` : ""}`;
+  }
+
+  return (
+    <div className="flex flex-1 overflow-hidden">
+      <aside
+        className={cn(
+          "w-full shrink-0 flex-col border-r border-border bg-card md:flex md:w-80",
+          thread ? "hidden" : "flex"
+        )}
+      >
+        <div className="shrink-0 space-y-2 border-b border-border p-3">
+          <Recherche q={q} onChange={(v) => router.replace(url({ q: v, lead: null }))} />
+          <div className="flex items-center gap-2 text-[12.5px]">
+            <Link
+              href={url({ archives: false, lead: null })}
+              className={cn("rounded-md px-2 py-0.5", !archives ? "bg-muted font-medium text-foreground" : "text-muted-foreground hover:text-foreground")}
+            >
+              Conversations
+            </Link>
+            <Link
+              href={url({ archives: true, lead: null })}
+              className={cn("rounded-md px-2 py-0.5", archives ? "bg-muted font-medium text-foreground" : "text-muted-foreground hover:text-foreground")}
+            >
+              Archivées{nbArchivees > 0 ? ` (${nbArchivees})` : ""}
+            </Link>
+          </div>
+        </div>
+        <div className="flex-1 overflow-y-auto">
+          {visibles.length === 0 ? (
+            <p className="p-5 text-sm text-muted-foreground">
+              {q
+                ? "Rien ne correspond à cette recherche."
+                : archives
+                  ? "Aucune conversation archivée."
+                  : "Aucune conversation pour l'instant. Elles apparaîtront ici dès qu'un message arrive sur le numéro de l'école."}
+            </p>
+          ) : (
+            visibles.map((c) => (
+              <ConversationRow key={c.leadId} c={c} href={url({ lead: c.leadId })} active={thread?.lead.id === c.leadId} />
+            ))
+          )}
+        </div>
+      </aside>
+
+      <section data-fil-ouvert={thread ? "" : undefined} className={cn("flex-1 flex-col overflow-hidden", thread ? "flex" : "hidden md:flex")}>
+        {thread ? (
+          <ThreadView
+            key={thread.lead.id} // un autre lead = un autre fil : citation et brouillon repartent de zéro
+            thread={thread}
+            templates={templates}
+            bootcamps={bootcamps}
+            quickReplies={quickReplies}
+            retour={url({ lead: null })}
+            gerer={gerer}
+          />
+        ) : (
+          <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+            <HugeiconsIcon icon={WhatsappIcon} size={28} />
+            <p className="text-sm">Choisissez une conversation.</p>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+/** Le champ de recherche : l'URL suit la frappe, avec un léger délai. */
+function Recherche({ q, onChange }: { q: string; onChange: (v: string) => void }) {
+  const [valeur, setValeur] = useState(q);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  return (
+    <div className="flex items-center gap-2 rounded-md bg-muted px-2.5 py-1.5 text-muted-foreground">
+      <HugeiconsIcon icon={Search01Icon} size={14} />
+      <input
+        value={valeur}
+        onChange={(e) => {
+          setValeur(e.target.value);
+          if (timer.current) clearTimeout(timer.current);
+          timer.current = setTimeout(() => onChange(e.target.value), 350);
+        }}
+        placeholder="Nom, numéro ou message…"
+        className="w-full bg-transparent text-xs outline-none placeholder:text-muted-foreground/70"
+      />
+      {valeur && (
+        <button
+          type="button"
+          onClick={() => {
+            setValeur("");
+            onChange("");
+          }}
+          className="text-xs hover:text-foreground"
+          aria-label="Effacer"
+        >
+          ✕
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ConversationRow({ c, href, active }: { c: Conversation; href: string; active: boolean }) {
+  const apercu = c.lastContent ?? "";
+  const { resolve } = useTeamProfiles();
+  return (
+    <Link
+      href={href}
+      className={cn(
+        "flex gap-3 border-b border-border px-4 py-3 transition-colors hover:bg-muted",
+        active && "bg-primary/10"
+      )}
+    >
+      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-semibold text-foreground">
+        {initials(c.fullName)}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline justify-between gap-2">
+          <p className={cn("truncate text-sm text-foreground", c.unread > 0 ? "font-semibold" : "font-medium")}>
+            {c.fullName}
+          </p>
+          <span className="shrink-0 text-[12.5px] text-muted-foreground">{formatRelative(c.lastAt)}</span>
+        </div>
+        <div className="flex items-center justify-between gap-2">
+          <p className={cn("truncate text-xs", c.unread > 0 ? "text-foreground" : "text-muted-foreground")}>
+            {c.lastDirection === "outbound" && <span className="text-muted-foreground">Vous : </span>}
+            {apercu}
+          </p>
+          {c.unread > 0 && (
+            <span className="shrink-0 rounded-full bg-primary px-1.5 py-0.5 text-[12px] font-semibold leading-none text-primary-foreground">
+              {c.unread}
+            </span>
+          )}
+        </div>
+        {(c.bootcamp || c.assignedTo) && (
+          <p className="mt-0.5 truncate text-[12.5px] text-muted-foreground">
+            {c.bootcamp}
+            {c.assignedTo && <span className="text-primary">{c.bootcamp ? " · " : ""}👤 {resolve(c.assignedTo).name}</span>}
+          </p>
+        )}
+      </div>
+    </Link>
+  );
+}
+
+function ThreadView({
+  thread,
+  templates,
+  bootcamps,
+  quickReplies,
+  retour,
+  gerer,
+}: {
+  gerer: boolean;
+  thread: Thread;
+  templates: WhatsAppTemplate[];
+  bootcamps: Bootcamp[];
+  quickReplies: QuickReply[];
+  retour: string;
+}) {
+  const router = useRouter();
+  const { lead, messages, lastInboundAt, ouverte } = thread;
+  const bas = useRef<HTMLDivElement>(null);
+  const [citation, setCitation] = useState<Citation | null>(null);
+  const [isPending, startTransition] = useTransition();
+  const [menu, setMenu] = useState(false);
+  const [plus, setPlus] = useState(false);
+
+  function nonLu() {
+    startTransition(async () => {
+      await markWhatsAppUnreadAction(lead.id);
+      router.push(retour); // rester dessus la remarquerait lue aussitôt
+    });
+  }
+  function archiver(v: boolean) {
+    startTransition(async () => {
+      await setWhatsAppArchivedAction(lead.id, v);
+      router.push(retour);
+    });
+  }
+
+  // Ouvrir la conversation, c'est la lire — pour toute l'équipe. Redéclenché
+  // quand un nouveau message arrive pendant qu'elle est ouverte.
+  useEffect(() => {
+    markWhatsAppReadAction(lead.id).then(() => router.refresh());
+  }, [lead.id, lastInboundAt, router]);
+
+  useEffect(() => {
+    bas.current?.scrollIntoView({ block: "end" });
+  }, [messages.length, lead.id]);
+
+  return (
+    <>
+      <header className="relative flex h-12 shrink-0 items-center gap-3 border-b border-border px-4">
+        <Link href={retour} className="text-muted-foreground hover:text-foreground md:hidden" aria-label="Retour">
+          <HugeiconsIcon icon={ArrowLeft01Icon} size={18} />
+        </Link>
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-semibold text-foreground">{lead.fullName}</p>
+          <p className="truncate text-[12.5px] text-muted-foreground">
+            {lead.mobileNo ?? "sans numéro"}
+            {lead.bootcamp ? ` · ${lead.bootcamp}` : " · aucune formation"}
+          </p>
+        </div>
+        {/* Bureau : les actions en ligne. Téléphone : dans le menu « ⋯ ». */}
+        <div className="hidden items-center gap-3 md:flex">
+        {gerer && !lead.bootcamp && <AttribuerFormation leadId={lead.id} bootcamps={bootcamps} />}
+        {gerer && <SuiviPar leadId={lead.id} assignedTo={thread.assignedTo} />}
+        <BoutonMediasLead leadId={lead.id} />
+        <button
+          type="button"
+          onClick={nonLu}
+          disabled={isPending || !lastInboundAt}
+          className="shrink-0 text-[12.5px] text-muted-foreground hover:text-foreground disabled:opacity-40"
+          title="Revenir plus tard : la conversation reprend sa pastille"
+        >
+          Non lu
+        </button>
+        <button
+          type="button"
+          onClick={() => archiver(!thread.archived)}
+          disabled={isPending || !gerer}
+          className="shrink-0 text-[12.5px] text-muted-foreground hover:text-foreground disabled:opacity-40"
+        >
+          {thread.archived ? "Désarchiver" : "Archiver"}
+        </button>
+        <Link href={`/leads/${lead.id}`} className="shrink-0 text-xs text-primary hover:underline">
+          Voir la fiche
+        </Link>
+        </div>
+        <button
+          type="button"
+          onClick={() => setMenu(!menu)}
+          className="rounded-md px-2 py-1 text-lg leading-none text-muted-foreground hover:bg-muted md:hidden"
+          aria-label="Plus d'actions"
+        >
+          ⋯
+        </button>
+        {menu && (
+          <div className="absolute right-2 top-12 z-30 flex w-60 flex-col items-stretch gap-3 rounded-xl border border-border bg-background p-3 shadow-xl md:hidden">
+        {gerer && !lead.bootcamp && <AttribuerFormation leadId={lead.id} bootcamps={bootcamps} />}
+        {gerer && <SuiviPar leadId={lead.id} assignedTo={thread.assignedTo} />}
+        <BoutonMediasLead leadId={lead.id} />
+        <button
+          type="button"
+          onClick={nonLu}
+          disabled={isPending || !lastInboundAt}
+          className="shrink-0 text-[12.5px] text-muted-foreground hover:text-foreground disabled:opacity-40"
+          title="Revenir plus tard : la conversation reprend sa pastille"
+        >
+          Non lu
+        </button>
+        <button
+          type="button"
+          onClick={() => archiver(!thread.archived)}
+          disabled={isPending || !gerer}
+          className="shrink-0 text-[12.5px] text-muted-foreground hover:text-foreground disabled:opacity-40"
+        >
+          {thread.archived ? "Désarchiver" : "Archiver"}
+        </button>
+        <Link href={`/leads/${lead.id}`} className="shrink-0 text-xs text-primary hover:underline">
+          Voir la fiche
+        </Link>
+          </div>
+        )}
+      </header>
+
+      <div className="flex-1 overflow-y-auto px-4 py-4">
+        <div className="mx-auto flex max-w-2xl flex-col gap-1.5">
+          {messages.map((m, i) => (
+            <Bulle
+              key={m.id}
+              m={m}
+              precedent={messages[i - 1]}
+              actif={gerer && ouverte && !!lead.mobileNo}
+              onRepondre={() => m.wamid && setCitation({ wamid: m.wamid, content: m.content, direction: m.direction })}
+              onReagir={(emoji) =>
+                m.wamid && lead.mobileNo ? reactWhatsAppAction(lead.id, lead.mobileNo, m.wamid, emoji).then(() => router.refresh()) : undefined
+              }
+            />
+          ))}
+          <div ref={bas} />
+        </div>
+      </div>
+
+      <div className="shrink-0 border-t border-border p-3">
+        <div className="mx-auto max-w-2xl">
+          {!gerer ? (
+            <p className="text-xs text-muted-foreground">Lecture seule : répondre demande le droit de gérer WhatsApp.</p>
+          ) : !lead.mobileNo ? (
+            <p className="text-xs text-muted-foreground">Ce lead n&apos;a pas de numéro : impossible de répondre.</p>
+          ) : ouverte ? (
+            <ReponseLibre
+              leadId={lead.id}
+              to={lead.mobileNo}
+              prenom={lead.fullName.split(" ")[0]}
+              formation={lead.bootcamp?.split(" · ")[0] ?? ""}
+              quickReplies={quickReplies}
+              citation={citation}
+              onCitationClear={() => setCitation(null)}
+              proposition={thread.proposition}
+            />
+          ) : (
+            <ReponseModele leadId={lead.id} to={lead.mobileNo} templates={templates} />
+          )}
+          {gerer && (
+          <>
+          <button type="button" onClick={() => setPlus(!plus)} className="mt-2 text-[12.5px] text-muted-foreground md:hidden">
+            {plus ? "− Moins" : "＋ Note, emplacement, carte, boutons…"}
+          </button>
+          <div className={cn("flex-wrap items-center gap-x-4 md:flex", plus ? "flex" : "hidden")}>
+            <NoteInterne leadId={lead.id} />
+            {ouverte && lead.mobileNo && <EnvoisSpeciaux leadId={lead.id} to={lead.mobileNo} />}
+          </div>
+          </>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+/** Un lead né d'un WhatsApp n'a pas de formation : on la lui donne ici, sans quitter le fil. */
+function AttribuerFormation({ leadId, bootcamps }: { leadId: string; bootcamps: Bootcamp[] }) {
+  const router = useRouter();
+  const [bootcampId, setBootcampId] = useState("");
+  const [erreur, setErreur] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
+
+  function attribuer() {
+    if (!bootcampId || isPending) return;
+    setErreur(null);
+    startTransition(async () => {
+      const r = await assignBootcampAction(leadId, bootcampId);
+      if (r.ok) router.refresh();
+      else setErreur(r.error);
+    });
+  }
+
+  return (
+    <div className="flex shrink-0 items-center gap-1.5">
+      <select
+        value={bootcampId}
+        onChange={(e) => setBootcampId(e.target.value)}
+        className="max-w-44 rounded-md border border-border bg-background px-2 py-1 text-xs outline-none focus:border-ring"
+        title={erreur ?? undefined}
+      >
+        <option value="">Attribuer une formation…</option>
+        {bootcamps.map((b) => (
+          <option key={b.id} value={b.id}>
+            {b.name}
+          </option>
+        ))}
+      </select>
+      <button
+        type="button"
+        onClick={attribuer}
+        disabled={!bootcampId || isPending}
+        className="rounded-md bg-primary px-2 py-1 text-xs font-medium text-primary-foreground disabled:opacity-40"
+      >
+        {isPending ? "…" : "OK"}
+      </button>
+      {erreur && <span className="text-[12.5px] text-red-600">{erreur}</span>}
+    </div>
+  );
+}
+
+function Bulle({
+  m,
+  precedent,
+  actif,
+  onRepondre,
+  onReagir,
+}: {
+  m: Message;
+  precedent?: Message;
+  actif: boolean; // fenêtre ouverte : on peut citer et réagir
+  onRepondre: () => void;
+  onReagir: (emoji: string) => void;
+}) {
+  const d = new Date(m.createdAt);
+  const jour = d.toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" });
+  const nouveauJour = !precedent || new Date(precedent.createdAt).toDateString() !== d.toDateString();
+  const sortant = m.direction === "outbound";
+  const [picker, setPicker] = useState(false);
+  const { resolve } = useTeamProfiles();
+  // Sans wamid (message d'avant les lots A/D), ni citation ni réaction possibles.
+  const outils = actif && !!m.wamid;
+  const reactions = [m.reactionLead, m.reactionUs].filter(Boolean) as string[];
+
+  // Une note de l'équipe : au milieu du fil, jamais envoyée au lead.
+  if (m.interne) {
+    return (
+      <>
+        {nouveauJour && (
+          <p className="my-2 text-center text-[12.5px] uppercase tracking-wider text-muted-foreground">{jour}</p>
+        )}
+        <div className="mx-auto my-1 w-full max-w-md rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+          <p className="mb-0.5 text-[12px] font-medium">
+            🔒 Note interne · {m.createdBy ? resolve(m.createdBy).name : "équipe"} ·{" "}
+            {d.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}
+          </p>
+          <p dir="auto" className="whitespace-pre-wrap break-words">{m.content}</p>
+        </div>
+      </>
+    );
+  }
+
+  return (
+    <>
+      {nouveauJour && (
+        <p className="my-2 text-center text-[12.5px] uppercase tracking-wider text-muted-foreground">{jour}</p>
+      )}
+      <div className={cn("group flex items-end gap-1", sortant ? "justify-end" : "justify-start")}>
+        {sortant && outils && (
+          <OutilsBulle m={m} picker={picker} setPicker={setPicker} onRepondre={onRepondre} onReagir={onReagir} />
+        )}
+        <div className="relative max-w-[80%]">
+        <div
+          className={cn(
+            "rounded-2xl px-3 py-2 text-sm whitespace-pre-wrap break-words",
+            sortant ? "rounded-br-sm bg-primary text-primary-foreground" : "rounded-bl-sm bg-muted text-foreground"
+          )}
+        >
+          {m.replyTo && (
+            <div
+              className={cn(
+                "mb-1.5 border-l-2 pl-2 text-xs opacity-80",
+                sortant ? "border-primary-foreground/60" : "border-primary"
+              )}
+            >
+              <span className="block text-[12px] font-medium">{m.replyTo.direction === "outbound" ? "Vous" : "Le lead"}</span>
+              <span dir="auto" className="line-clamp-2">{m.replyTo.content}</span>
+            </div>
+          )}
+          {m.media && <PieceJointe media={m.media} sortant={sortant} />}
+          {/* Sans légende, le texte n'est que le libellé « 📷 Photo » : le média suffit. */}
+          {!(m.media && m.media.kind !== "document" && /^(📷|🎥|🎤|Sticker)/.test(m.content ?? "")) && (
+            // L'arabe se lit de droite à gauche : le sens vient du texte lui-même.
+            <span dir="auto" className="block">{m.content}</span>
+          )}
+          <p className={cn("mt-1 text-right text-[12px]", sortant ? "text-primary-foreground/70" : "text-muted-foreground")}>
+            {sortant && m.createdBy ? `${resolve(m.createdBy).name} · ` : ""}
+            {d.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}
+            {sortant && <Accuse status={m.status} />}
+          </p>
+        </div>
+        {reactions.length > 0 && (
+          <span
+            className={cn(
+              "absolute -bottom-2 rounded-full border border-border bg-background px-1.5 text-xs leading-5 shadow-sm",
+              sortant ? "left-1" : "right-1"
+            )}
+            title={[m.reactionLead && `Le lead : ${m.reactionLead}`, m.reactionUs && `Vous : ${m.reactionUs}`].filter(Boolean).join(" · ")}
+          >
+            {reactions.join("")}
+          </span>
+        )}
+        </div>
+        {!sortant && outils && (
+          <OutilsBulle m={m} picker={picker} setPicker={setPicker} onRepondre={onRepondre} onReagir={onReagir} />
+        )}
+      </div>
+      {sortant && m.status === "failed" && (
+        <p className="-mt-0.5 text-right text-[12.5px] text-red-600">{m.error ?? "Échec de l'envoi."}</p>
+      )}
+    </>
+  );
+}
+
+/** « Répondre » et le choix d'un emoji, visibles au survol de la bulle. */
+function OutilsBulle({
+  m,
+  picker,
+  setPicker,
+  onRepondre,
+  onReagir,
+}: {
+  m: Message;
+  picker: boolean;
+  setPicker: (v: boolean) => void;
+  onRepondre: () => void;
+  onReagir: (emoji: string) => void;
+}) {
+  return (
+    <div className="relative mb-4 flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+      <button
+        type="button"
+        onClick={onRepondre}
+        className="rounded px-1 text-[12.5px] text-muted-foreground hover:bg-muted hover:text-foreground"
+        title="Répondre à ce message"
+      >
+        ↩
+      </button>
+      <button
+        type="button"
+        onClick={() => setPicker(!picker)}
+        className="rounded px-1 text-[13px] text-muted-foreground hover:bg-muted hover:text-foreground"
+        title="Réagir"
+      >
+        {m.reactionUs ?? "☺"}
+      </button>
+      {picker && (
+        <div className="absolute bottom-6 z-10 flex gap-0.5 rounded-full border border-border bg-background px-1.5 py-1 shadow-md">
+          {EMOJIS.map((e) => (
+            <button
+              key={e}
+              type="button"
+              onClick={() => {
+                setPicker(false);
+                // Recliquer l'emoji déjà posé le retire.
+                onReagir(m.reactionUs === e ? "" : e);
+              }}
+              className={cn("rounded-full px-1 text-base hover:bg-muted", m.reactionUs === e && "bg-muted")}
+            >
+              {e}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PieceJointe({ media, sortant }: { media: NonNullable<Message["media"]>; sortant: boolean }) {
+  switch (media.kind) {
+    case "image":
+    case "sticker":
+      return (
+        <a href={media.url} target="_blank" rel="noreferrer" className="mb-1 block">
+          {/* eslint-disable-next-line @next/next/no-img-element -- URL externe du bucket, taille inconnue */}
+          <img
+            src={media.url}
+            alt=""
+            className={cn("rounded-lg object-cover", media.kind === "sticker" ? "h-28 w-28" : "max-h-72 w-full max-w-xs")}
+          />
+        </a>
+      );
+    case "video":
+      return <video src={media.url} controls preload="metadata" className="mb-1 max-h-72 w-full max-w-xs rounded-lg" />;
+    case "audio":
+      return <audio src={media.url} controls preload="metadata" className="mb-1 w-64 max-w-full" />;
+    case "document":
+      return (
+        <a
+          href={media.url}
+          target="_blank"
+          rel="noreferrer"
+          className={cn("mb-1 block underline underline-offset-2", sortant ? "text-primary-foreground" : "text-primary")}
+        >
+          📄 {media.filename ?? "Document"}
+        </a>
+      );
+  }
+}
+
+/**
+ * Enregistrer un vocal dans le navigateur, directement en ogg/opus — le seul
+ * format que WhatsApp affiche comme un message vocal. Chrome n'enregistre
+ * qu'en webm : l'encodeur (opus-recorder, wasm) tourne dans un worker servi
+ * depuis /opus/. Le résultat devient un File, envoyé comme une pièce jointe.
+ */
+function useVocal(onFichier: (f: File) => void, onErreur: (e: string) => void) {
+  const [enregistre, setEnregistre] = useState(false);
+  const [secondes, setSecondes] = useState(0);
+  const rec = useRef<{ stop: () => void; close: () => void } | null>(null);
+  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  async function demarrer() {
+    try {
+      const { default: Recorder } = await import("opus-recorder");
+      const r = new Recorder({
+        encoderPath: "/opus/encoderWorker.min.js",
+        encoderApplication: 2048, // voix
+        encoderSampleRate: 48000,
+        encoderBitRate: 32000,
+        numberOfChannels: 1,
+      });
+      const morceaux: Uint8Array[] = [];
+      r.ondataavailable = (data) => morceaux.push(data);
+      r.onstop = () => {
+        const blob = new Blob(morceaux as BlobPart[], { type: "audio/ogg" });
+        onFichier(new File([blob], `vocal-${Date.now()}.ogg`, { type: "audio/ogg" }));
+        r.close();
+        rec.current = null;
+      };
+      await r.start();
+      rec.current = r;
+      setSecondes(0);
+      setEnregistre(true);
+      timer.current = setInterval(() => setSecondes((n) => n + 1), 1000);
+    } catch (e) {
+      onErreur(
+        e instanceof Error && e.name === "NotAllowedError"
+          ? "Micro refusé par le navigateur — autorisez-le pour ce site."
+          : "Impossible de démarrer l'enregistrement."
+      );
+    }
+  }
+
+  function arreter() {
+    if (timer.current) clearInterval(timer.current);
+    timer.current = null;
+    setEnregistre(false);
+    rec.current?.stop();
+  }
+
+  const duree = `${Math.floor(secondes / 60)}:${String(secondes % 60).padStart(2, "0")}`;
+  return { enregistre, duree, demarrer, arreter };
+}
+
+/** L'accusé en mots plutôt qu'en coches : Envoyé, Reçu, Vu, Échec. Rien = statut inconnu. */
+function Accuse({ status }: { status: Message["status"] }) {
+  if (!status || status === "received") return null;
+  if (status === "failed") return <span className="ml-1 font-semibold text-red-300">· Échec</span>;
+  return (
+    <span className={cn("ml-1", status === "read" ? "font-semibold text-sky-200" : "text-primary-foreground/70")}>
+      · {status === "read" ? "Vu" : status === "delivered" ? "Reçu" : "Envoyé"}
+    </span>
+  );
+}
+
+function ReponseLibre({
+  leadId,
+  to,
+  prenom,
+  formation,
+  quickReplies,
+  citation,
+  onCitationClear,
+  proposition,
+}: {
+  leadId: string;
+  to: string;
+  prenom: string;
+  formation: string;
+  quickReplies: QuickReply[];
+  citation: Citation | null;
+  onCitationClear: () => void;
+  proposition: Thread["proposition"];
+}) {
+  const router = useRouter();
+  const [texte, setTexte] = useState("");
+  const [propositionVue, setPropositionVue] = useState<string | null>(null);
+  const zone = useRef<HTMLTextAreaElement>(null);
+  // « / » en début de message ouvre la liste des réponses rapides, filtrée par ce qui suit.
+  const filtre = texte.startsWith("/") && !texte.includes("\n") ? texte.slice(1).toLowerCase() : null;
+  const suggestions = filtre === null ? [] : quickReplies.filter((q) => q.shortcut.startsWith(filtre)).slice(0, 6);
+  function inserer(q: QuickReply) {
+    // Les variables du texte prêt prennent les valeurs de CE lead.
+    setTexte(q.text.replace(/\{\{firstName\}\}/g, prenom).replace(/\{\{formation\}\}/g, formation));
+    zone.current?.focus();
+  }
+  const [fichier, setFichier] = useState<File | null>(null);
+  const [erreur, setErreur] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
+  const fileRef = useRef<HTMLInputElement>(null);
+  const vocal = useVocal((f) => setFichier(f), (e) => setErreur(e));
+  const estVocal = fichier?.type === "audio/ogg";
+  // Une URL d'aperçu par vocal, libérée quand il change — pas une par rendu.
+  const apercu = useMemo(() => (estVocal && fichier ? URL.createObjectURL(fichier) : null), [fichier, estVocal]);
+  useEffect(() => () => {
+    if (apercu) URL.revokeObjectURL(apercu);
+  }, [apercu]);
+
+  function envoyer() {
+    if ((!texte.trim() && !fichier) || isPending) return;
+    setErreur(null);
+    startTransition(async () => {
+      let r: { ok: true } | { ok: false; error: string };
+      if (fichier) {
+        // Avec une pièce jointe, le texte devient sa légende.
+        const fd = new FormData();
+        fd.set("leadId", leadId);
+        fd.set("to", to);
+        fd.set("caption", texte);
+        fd.set("file", fichier);
+        if (citation) fd.set("replyTo", citation.wamid);
+        r = await sendWhatsAppMediaAction(fd);
+      } else {
+        r = await replyWhatsAppAction(leadId, to, texte, citation?.wamid ?? null);
+      }
+      if (r.ok) {
+        setTexte("");
+        setFichier(null);
+        onCitationClear();
+        if (fileRef.current) fileRef.current.value = "";
+        router.refresh();
+      } else {
+        setErreur(r.error);
+      }
+    });
+  }
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        envoyer();
+      }}
+    >
+      {proposition && propositionVue !== proposition.id && (
+        // La proposition de l'assistant : un clic la met dans la zone de
+        // réponse, où l'on peut la corriger avant d'envoyer.
+        <div
+          className={cn(
+            "mb-2 rounded-lg border p-2.5 text-[12.5px]",
+            proposition.decision === "escalade"
+              ? "border-amber-300 bg-amber-50 text-amber-950"
+              : "border-violet-200 bg-violet-50 text-violet-950"
+          )}
+        >
+          <div className="mb-1 flex flex-wrap items-center gap-2">
+            <span className="font-medium">
+              ✨ L&apos;assistant propose · {proposition.score} %
+              {proposition.decision === "escalade" ? " · il a passé la main" : ""}
+              {proposition.decision === "formulaire" ? " · + formulaire d'inscription" : ""}
+            </span>
+            <span className="flex-1" />
+            <button
+              type="button"
+              onClick={() => {
+                setTexte(proposition.draft);
+                setPropositionVue(proposition.id);
+                zone.current?.focus();
+              }}
+              className="rounded-md bg-violet-600 px-2 py-0.5 text-[12px] font-medium text-white hover:bg-violet-700"
+            >
+              Utiliser
+            </button>
+            <button type="button" onClick={() => setPropositionVue(proposition.id)} className="text-[12px] opacity-70 hover:underline">
+              Ignorer
+            </button>
+          </div>
+          <p dir="auto" className="max-h-28 overflow-y-auto whitespace-pre-wrap md:max-h-none">{proposition.draft}</p>
+          {/* Téléphone : les raisons et la remarque se déplient, pour laisser voir le fil. */}
+          <details className="mt-1 md:hidden">
+            <summary className="cursor-pointer text-[11.5px] opacity-70">Pourquoi cette note ?</summary>
+            <p className="mt-1 text-[11.5px] opacity-70">{proposition.raisons}</p>
+            <RemarqueAssistant question={proposition.question} />
+          </details>
+          <div className="hidden md:block">
+            <p className="mt-1 text-[11.5px] opacity-70">{proposition.raisons}</p>
+            <RemarqueAssistant question={proposition.question} />
+          </div>
+        </div>
+      )}
+      {citation && (
+        <div className="mb-1.5 flex items-start gap-2 rounded-lg border-l-2 border-primary bg-muted px-2.5 py-1.5 text-xs">
+          <div className="min-w-0 flex-1">
+            <span className="block text-[12px] font-medium text-muted-foreground">
+              En réponse à {citation.direction === "outbound" ? "vous" : "le lead"}
+            </span>
+            <span className="line-clamp-2 text-foreground">{citation.content}</span>
+          </div>
+          <button type="button" onClick={onCitationClear} className="text-muted-foreground hover:text-foreground" aria-label="Retirer la citation">
+            ✕
+          </button>
+        </div>
+      )}
+      {suggestions.length > 0 && (
+        <div className="mb-1.5 overflow-hidden rounded-lg border border-border bg-background shadow-sm">
+          {suggestions.map((q) => (
+            <button
+              key={q.shortcut}
+              type="button"
+              onClick={() => inserer(q)}
+              className="flex w-full items-baseline gap-2 px-3 py-1.5 text-left hover:bg-muted"
+            >
+              <span className="shrink-0 font-mono text-xs text-primary">/{q.shortcut}</span>
+              <span className="truncate text-xs text-muted-foreground">{q.text}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {filtre !== null && suggestions.length === 0 && quickReplies.length === 0 && (
+        <p className="mb-1.5 text-[12.5px] text-muted-foreground">
+          Aucune réponse rapide — créez-en dans Paramètres → WhatsApp.
+        </p>
+      )}
+      <textarea dir="auto"
+        ref={zone}
+        value={texte}
+        onChange={(e) => setTexte(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) envoyer();
+          // Entrée ou Tab sur une suggestion unique l'insère.
+          if ((e.key === "Enter" || e.key === "Tab") && suggestions.length === 1 && filtre !== null) {
+            e.preventDefault();
+            inserer(suggestions[0]);
+          }
+        }}
+        placeholder={estVocal ? "Le vocal part sans texte." : fichier ? "Légende (facultative)…" : "Votre réponse… (« / » pour une réponse rapide)"}
+        disabled={estVocal}
+        rows={2}
+        className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-ring focus:ring-2 focus:ring-ring/30"
+      />
+      <div className="mt-1.5 flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <input
+            ref={fileRef}
+            type="file"
+            accept="image/jpeg,image/png,video/mp4,application/pdf"
+            className="hidden"
+            onChange={(e) => setFichier(e.target.files?.[0] ?? null)}
+          />
+          {vocal.enregistre ? (
+            <button
+              type="button"
+              onClick={vocal.arreter}
+              className="flex items-center gap-1.5 rounded-md bg-red-600 px-2 py-1 text-[12.5px] font-medium text-white"
+            >
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" />
+              {vocal.duree} · Arrêter
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={vocal.demarrer}
+              disabled={isPending || !!fichier}
+              className="flex items-center gap-1 text-[12.5px] text-muted-foreground hover:text-foreground disabled:opacity-40"
+              title="Enregistrer un vocal"
+            >
+              <HugeiconsIcon icon={Mic01Icon} size={14} />
+              Vocal
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => fileRef.current?.click()}
+            disabled={vocal.enregistre}
+            className="flex items-center gap-1 text-[12.5px] text-muted-foreground hover:text-foreground disabled:opacity-40"
+            title="Photo, vidéo ou PDF — 4 Mo max"
+          >
+            <HugeiconsIcon icon={Attachment01Icon} size={14} />
+            {fichier && !estVocal ? (
+              <span className="max-w-48 truncate text-foreground">{fichier.name}</span>
+            ) : (
+              "Joindre"
+            )}
+          </button>
+          {apercu && <audio src={apercu} controls className="h-7 w-44" />}
+          {fichier && (
+            <button
+              type="button"
+              onClick={() => {
+                setFichier(null);
+                if (fileRef.current) fileRef.current.value = "";
+              }}
+              className="text-[12.5px] text-muted-foreground hover:text-red-600"
+            >
+              ✕
+            </button>
+          )}
+          <p className="truncate text-[12.5px] text-muted-foreground">{erreur ?? (fichier ? "" : "⌘↵ pour envoyer")}</p>
+        </div>
+        <button
+          type="submit"
+          disabled={isPending || (!texte.trim() && !fichier)}
+          className="shrink-0 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+        >
+          {isPending ? "Envoi…" : "Envoyer"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function ReponseModele({ leadId, to, templates }: { leadId: string; to: string; templates: WhatsAppTemplate[] }) {
+  const router = useRouter();
+  const [nom, setNom] = useState(templates[0]?.name ?? "");
+  const [variables, setVariables] = useState<string[]>([]);
+  const [erreur, setErreur] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
+  const modele = templates.find((t) => t.name === nom) ?? null;
+  // Modèle avec le formulaire d'inscription : les sessions possibles, chargées à la demande.
+  const [formations, setFormations] = useState<{ id: string; name: string }[] | null>(null);
+  const [arrivee, setArrivee] = useState("");
+  useEffect(() => {
+    if (!modele?.formulaire || formations) return;
+    whatsAppComposerDataAction(leadId).then((d) => {
+      if (!d.ok) return setFormations([]);
+      setFormations(d.formations);
+      setArrivee(d.formationParDefaut ?? "");
+    });
+  }, [modele?.formulaire, formations, leadId]);
+
+  function envoyer() {
+    if (!modele || isPending) return;
+    setErreur(null);
+    startTransition(async () => {
+      const r = await replyWhatsAppTemplateAction(
+        leadId,
+        to,
+        { name: modele.name, language: modele.language, body: modele.body },
+        Array.from({ length: modele.variables }, (_, i) => variables[i] ?? ""),
+        modele.formulaire ? arrivee : null
+      );
+      if (r.ok) {
+        setVariables([]);
+        router.refresh();
+      } else {
+        setErreur(r.error);
+      }
+    });
+  }
+
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-muted-foreground">
+        Cette personne n&apos;a pas écrit depuis plus de 24 h : Meta n&apos;accepte qu&apos;un{" "}
+        <strong className="font-medium text-foreground">modèle approuvé</strong>. Dès qu&apos;elle
+        répond, vous pourrez écrire librement.
+      </p>
+      {templates.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          Aucun modèle approuvé sur le compte pour l&apos;instant.
+        </p>
+      ) : (
+        <>
+          <select
+            value={nom}
+            onChange={(e) => {
+              setNom(e.target.value);
+              setVariables([]);
+            }}
+            className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-ring"
+          >
+            {templates.map((t) => (
+              <option key={`${t.name}-${t.language}`} value={t.name}>
+                {t.name} ({t.language})
+              </option>
+            ))}
+          </select>
+          {modele?.body && (
+            <p dir="auto" className="rounded-lg bg-muted px-3 py-2 text-xs whitespace-pre-wrap text-foreground">{modele.body}</p>
+          )}
+          {modele &&
+            Array.from({ length: modele.variables }, (_, i) => (
+              <input
+                key={i}
+                value={variables[i] ?? ""}
+                onChange={(e) => {
+                  const v = [...variables];
+                  v[i] = e.target.value;
+                  setVariables(v);
+                }}
+                placeholder={`Valeur de {{${i + 1}}}`}
+                className="w-full rounded-lg border border-border bg-background px-3 py-1.5 text-sm outline-none focus:border-ring"
+              />
+            ))}
+          {modele?.formulaire && (
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-foreground">Formation d&apos;arrivée</span>
+              {formations === null ? (
+                <span className="text-[12.5px] text-muted-foreground">Chargement…</span>
+              ) : formations.length === 0 ? (
+                <span className="text-[12.5px] text-red-600">Aucune autre formation ouverte.</span>
+              ) : (
+                <select
+                  value={arrivee}
+                  onChange={(e) => setArrivee(e.target.value)}
+                  className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-ring"
+                >
+                  {formations.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      {f.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </label>
+          )}
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-[12.5px] text-red-600">{erreur}</p>
+            <button
+              type="button"
+              onClick={envoyer}
+              disabled={isPending || !modele || (modele.formulaire && !arrivee)}
+              className="rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+            >
+              {isPending ? "Envoi…" : "Envoyer le modèle"}
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * « ✎ Remarque » sous une proposition de l'assistant : « trop long », « ne dis
+ * jamais le soir »… La remarque devient une règle qu'il respecte ensuite.
+ */
+function RemarqueAssistant({ question }: { question: string }) {
+  const [ouvert, setOuvert] = useState(false);
+  const [texte, setTexte] = useState("");
+  const [fait, setFait] = useState(false);
+  const [isPending, startTransition] = useTransition();
+  if (fait) return <p className="mt-1.5 text-[12px] text-green-700">✓ Retenu : il respectera cette règle.</p>;
+  if (!ouvert) {
+    return (
+      <button type="button" onClick={() => setOuvert(true)} className="mt-1.5 text-[12px] font-medium opacity-80 hover:underline">
+        ✎ Remarque pour l&apos;assistant
+      </button>
+    );
+  }
+  return (
+    <div className="mt-1.5 flex gap-1.5">
+      <input
+        value={texte}
+        onChange={(e) => setTexte(e.target.value)}
+        placeholder="Ex. : ne dis jamais que les sessions sont le soir"
+        className="min-w-0 flex-1 rounded-md border border-border bg-background px-2 py-1 text-[12.5px] text-foreground outline-none focus:border-ring"
+      />
+      <button
+        type="button"
+        disabled={isPending || !texte.trim()}
+        onClick={() =>
+          startTransition(async () => {
+            const r = await remarqueAssistantAction(texte, question);
+            if (r.ok) setFait(true);
+          })
+        }
+        className="rounded-md bg-violet-600 px-2 py-1 text-[12px] font-medium text-white disabled:opacity-50"
+      >
+        {isPending ? "…" : "Retenir"}
+      </button>
+    </div>
+  );
+}
+
+
+/** « Suivi par » : le membre de l'équipe qui s'occupe de cette conversation. */
+function SuiviPar({ leadId, assignedTo }: { leadId: string; assignedTo: string | null }) {
+  const router = useRouter();
+  const { resolve } = useTeamProfiles();
+  const [equipe, setEquipe] = useState<string[]>([]);
+  const [isPending, startTransition] = useTransition();
+  useEffect(() => {
+    getTeamAction()
+      .then((t) => setEquipe(t.map((m) => m.email)))
+      .catch(() => setEquipe([]));
+  }, []);
+  const choix = assignedTo && !equipe.includes(assignedTo) ? [assignedTo, ...equipe] : equipe;
+  return (
+    <select
+      value={assignedTo ?? ""}
+      disabled={isPending}
+      onChange={(e) =>
+        startTransition(async () => {
+          await assignerConversationAction(leadId, e.target.value || null);
+          router.refresh();
+        })
+      }
+      className="max-w-36 shrink-0 rounded-md border border-border bg-background px-2 py-1 text-[12.5px] text-foreground outline-none focus:border-ring"
+      title="Qui suit cette conversation"
+    >
+      <option value="">👤 Suivi par…</option>
+      {choix.map((email) => (
+        <option key={email} value={email}>
+          👤 {resolve(email).name}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+/** Une note pour l'équipe, glissée dans le fil — le lead ne la voit jamais. */
+function NoteInterne({ leadId }: { leadId: string }) {
+  const router = useRouter();
+  const [ouvert, setOuvert] = useState(false);
+  const [texte, setTexte] = useState("");
+  const [erreur, setErreur] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
+  if (!ouvert) {
+    return (
+      <button type="button" onClick={() => setOuvert(true)} className="mt-2 text-[12.5px] text-amber-700 hover:underline">
+        🔒 Ajouter une note interne
+      </button>
+    );
+  }
+  return (
+    <div className="mt-2 flex items-start gap-2">
+      <textarea
+        dir="auto"
+        value={texte}
+        onChange={(e) => setTexte(e.target.value)}
+        rows={2}
+        autoFocus
+        placeholder="Visible par l'équipe seulement (ex. « déjà appelée, rappeler lundi »)"
+        className="min-w-0 flex-1 resize-none rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 outline-none placeholder:text-amber-700/60"
+      />
+      <div className="flex flex-col gap-1">
+        <button
+          type="button"
+          disabled={isPending || !texte.trim()}
+          onClick={() =>
+            startTransition(async () => {
+              setErreur(null);
+              const r = await noteInterneAction(leadId, texte);
+              if (!r.ok) return setErreur(r.error);
+              setTexte("");
+              setOuvert(false);
+              router.refresh();
+            })
+          }
+          className="rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white disabled:opacity-40"
+        >
+          {isPending ? "…" : "Noter"}
+        </button>
+        <button type="button" onClick={() => setOuvert(false)} className="text-[12px] text-muted-foreground hover:text-foreground">
+          Annuler
+        </button>
+        {erreur && <span className="text-[12px] text-red-600">{erreur}</span>}
+      </div>
+    </div>
+  );
+}
+
+/** Emplacement du local, carte contact, message à choix : dans la fenêtre de 24 h. */
+function EnvoisSpeciaux({ leadId, to }: { leadId: string; to: string }) {
+  const router = useRouter();
+  const [panneau, setPanneau] = useState<null | "contact" | "choix">(null);
+  const [nom, setNom] = useState("");
+  const [tel, setTel] = useState("");
+  const [texte, setTexte] = useState("");
+  const [choix, setChoix] = useState(["", "", ""]);
+  const [message, setMessage] = useState<{ ok: boolean; t: string } | null>(null);
+  const [isPending, startTransition] = useTransition();
+
+  function lancer(f: () => Promise<{ ok: true } | { ok: false; error: string }>, fait: string) {
+    setMessage(null);
+    startTransition(async () => {
+      const r = await f();
+      if (!r.ok) return setMessage({ ok: false, t: r.error });
+      setMessage({ ok: true, t: fait });
+      setPanneau(null);
+      router.refresh();
+    });
+  }
+  const champ = "rounded-md border border-border bg-background px-2 py-1 text-xs outline-none focus:border-ring";
+
+  return (
+    <div className="mt-2 w-full">
+      <div className="flex flex-wrap items-center gap-3 text-[12.5px]">
+        <button type="button" disabled={isPending} onClick={() => lancer(() => envoyerEmplacementAction(leadId, to), "Emplacement envoyé")} className="text-muted-foreground hover:text-foreground disabled:opacity-40">
+          📍 Emplacement
+        </button>
+        <button type="button" onClick={() => setPanneau(panneau === "contact" ? null : "contact")} className="text-muted-foreground hover:text-foreground">
+          👤 Carte contact
+        </button>
+        <button type="button" onClick={() => setPanneau(panneau === "choix" ? null : "choix")} className="text-muted-foreground hover:text-foreground">
+          🔘 Boutons / menu
+        </button>
+        {message && <span className={message.ok ? "text-green-700" : "text-red-600"}>{message.t}</span>}
+      </div>
+
+      {panneau === "contact" && (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <input value={nom} onChange={(e) => setNom(e.target.value)} placeholder="Nom (ex. Amel — Mon école)" className={champ} />
+          <input value={tel} onChange={(e) => setTel(e.target.value)} placeholder="Numéro avec indicatif" className={champ} />
+          <button type="button" disabled={isPending} onClick={() => lancer(() => envoyerContactAction(leadId, to, nom, tel), "Carte envoyée")} className="rounded-md bg-primary px-2 py-1 text-xs font-medium text-primary-foreground disabled:opacity-40">
+            Envoyer
+          </button>
+        </div>
+      )}
+
+      {panneau === "choix" && (
+        <div className="mt-2 space-y-1.5">
+          <input dir="auto" value={texte} onChange={(e) => setTexte(e.target.value)} placeholder="Le message (ex. شنوة تحب تعرف؟)" className={`${champ} w-full`} />
+          <div className="flex flex-wrap gap-1.5">
+            {choix.map((c, i) => (
+              <input
+                key={i}
+                dir="auto"
+                value={c}
+                onChange={(e) => setChoix(choix.map((x, j) => (j === i ? e.target.value : x)))}
+                placeholder={`Choix ${i + 1}`}
+                className={`${champ} w-36`}
+              />
+            ))}
+            {choix.length < 10 && (
+              <button type="button" onClick={() => setChoix([...choix, ""])} className="text-[12.5px] text-muted-foreground hover:text-foreground">
+                + choix
+              </button>
+            )}
+          </div>
+          <p className="text-[12px] text-muted-foreground">
+            3 choix ou moins : des boutons (20 caractères). Plus : un menu (24 caractères, 10 au plus).
+          </p>
+          <button type="button" disabled={isPending} onClick={() => lancer(() => envoyerChoixAction(leadId, to, texte, choix), "Message à choix envoyé")} className="rounded-md bg-primary px-2 py-1 text-xs font-medium text-primary-foreground disabled:opacity-40">
+            Envoyer
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
