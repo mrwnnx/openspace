@@ -24,6 +24,10 @@ concurrency:
 
 jobs:
   import:
+    # Tant que la variable CRM_URL n'est pas définie (dépôt tout juste copié,
+    # CRM pas encore en ligne), le job est ignoré au lieu d'échouer toutes les
+    # 15 min. Réglage : Settings → Secrets and variables → Actions (INSTALL.md §9).
+    if: ${{ vars.CRM_URL != '' }}
     runs-on: ubuntu-latest
     steps:
       - name: Déclencher l'import
